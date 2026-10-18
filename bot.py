@@ -284,8 +284,8 @@ def handle_help(chat_id, message_id=None):
 def handle_about(chat_id, message_id=None):
     text = (
         "ℹ️ <b>About ReClip Bot</b>\n\n"
-        "Powering downloads with <b>yt-dlp</b> + <b>ffmpeg</b>.\n"
-        "Hosted on <b>GitHub Actions</b> — free, always-on, auto-restarting.\n\n"
+        "A fast, always-on downloader powered by <b>yt-dlp</b> + <b>ffmpeg</b>.\n"
+        "Supports 1000+ sites for video and audio downloads.\n\n"
         "Please respect copyright and only download content you have the right to."
     )
     if message_id:
