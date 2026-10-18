@@ -44,7 +44,7 @@ Expected scopes include `repo` and `workflow`.
 
 ```
 .
-├── bot.py                      # the whole bot (bot logic + UI + cookies + janitor)
+├── bot.py                      # the whole bot (WARP + UI + download engine + janitor)
 ├── requirements.txt            # requests, yt-dlp
 ├── README.md                   # human setup guide
 ├── AGENT.md                    # this file
@@ -56,10 +56,10 @@ Expected scopes include `repo` and `workflow`.
 | Section | Lines (approx) | Purpose |
 |---|---|---|
 | Telegram API helpers | top | `api()`, `send_message`, `edit_message`, callbacks |
-| Cookie engine | mid | `to_netscape` (any-format converter), `looks_like_cookies`, `save_cookies`, `purge_cookies` |
+| WARP relay | mid | `setup_warp`, `warp_watchdog`, `_write_wp_conf`, `_register_profile` |
 | Download engine | mid | `base_cmd`, `yt_info`, `run_download`, `compress_to_fit`, `send_media` |
-| UI | mid | `handle_start/help/about/cookies/status`, `main_menu` |
-| Fetch + deliver | mid | `fetch_and_prompt`, `deliver`, `is_blocking` |
+| UI | mid | `handle_start/help/about/status`, `main_menu` |
+| Fetch + deliver | mid | `fetch_and_prompt`, `deliver` |
 | Update loop | bottom | `handle_update`, `janitor_loop`, `main`, `trigger_rerun` |
 
 ---
@@ -72,7 +72,7 @@ Set via `Settings → Secrets and variables → Actions`, or programmatically (s
 |---|---|---|
 | `BOT_TOKEN` | ✅ | Telegram bot token |
 | `GH_PAT` | ✅ | Lets the bot dispatch its own rerun |
-| `YT_COOKIES` | ➖ | Optional seed cookies (any format) |
+| `WGCF_PROFILE` | ➖ | Optional pre-made WARP WireGuard profile |
 
 ---
 
@@ -155,9 +155,7 @@ Success = run `in_progress` with step **"Run bot"** running, and `getMe` returns
 | `GH_REPO` | — | set by workflow from `github.repository` |
 | `WORKFLOW_FILE` | `bot.yml` | workflow to dispatch |
 | `RUNTIME_MINUTES` | `340` | worker lifetime |
-| `COOKIE_TTL_MIN` | `30` | cookie auto-delete window |
 | `FILE_TTL_MIN` | `10` | downloaded-file auto-delete window |
-| `YT_COOKIES` | — | optional cookie seed (any format) |
 | `WARP_ENABLE` | `1` | bring up Cloudflare WARP relay (fixes YouTube) |
 | `WARP_PROXY_PORT` | `25344` | local SOCKS5 port for the WARP relay |
 | `WGCF_PROFILE` | — | optional pre-made WARP WireGuard profile |
@@ -168,13 +166,14 @@ Success = run `in_progress` with step **"Run bot"** running, and `getMe` returns
 
 - **YouTube is fixed by Cloudflare WARP.** Datacenter IPs get "Sign in to confirm you're not a
   bot". The bot starts a userspace WireGuard (wireproxy + wgcf) SOCKS5 relay on boot and routes
-  yt-dlp through it. Verified working with **no cookies**: 1080p, MP3 and 4K formats all download.
-  Cookies remain a fallback for Instagram/Reddit/Vimeo or if WARP is unavailable.
+  yt-dlp through it. Verified working: **YouTube 1080p, 4K and MP3 — no cookies needed.**
+- **WARP fallback chain.** On failure the bot tries 9 WARP endpoints, then re-registers a
+  fresh account and retries. If WARP is entirely unavailable it falls back to alternate
+  player clients and direct connections. A watchdog re-checks every 45 s.
 - **Only one worker may run at once** — Telegram allows a single `getUpdates` consumer.
   The workflow uses a `concurrency` group to enforce this.
-- **Cookies & files are ephemeral by design.** A janitor thread wipes cookies after
-  `COOKIE_TTL_MIN` and files after `FILE_TTL_MIN`; shutdown purges cookies too. Each
-  Actions run gets a fresh VM, so nothing survives a restart anyway.
+- **Files are ephemeral by design.** A janitor thread wipes downloads after `FILE_TTL_MIN`;
+  each Actions run also gets a fresh VM, so nothing survives a restart.
 - **GitHub ToS:** long-running Telegram bots on Actions are a grey area. The self-rerun plus a
   watchdog cron (`17 */6 * * *`) keeps it resilient; if the workflow gets disabled, re-enable it
   with `PUT .../actions/workflows/bot.yml/enable`.
@@ -189,6 +188,6 @@ Success = run `in_progress` with step **"Run bot"** running, and `getMe` returns
 | Change bot text / UI | `handle_*` functions in `bot.py` |
 | Add a supported site | nothing — yt-dlp handles it |
 | Change quality list | `quality_options()` |
-| Change cookie/file lifetime | workflow `env:` or defaults in `bot.py` |
+| Change file lifetime | workflow `env:` or `FILE_TTL_MIN` in `bot.py` |
 | Change run length | `RUNTIME_MINUTES` + workflow `timeout-minutes` |
 | Add a new command | `handle_update()` message branch + a `handle_*` function |

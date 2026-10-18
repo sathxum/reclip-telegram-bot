@@ -1,7 +1,7 @@
 # ReClip Telegram Bot 🤖
 
-A Telegram bot that downloads video/audio from **1000+ sites** (TikTok, Instagram, Facebook,
-Twitter/X, YouTube, Reddit, Vimeo, Dailymotion and more) powered by `yt-dlp` + `ffmpeg`.
+A Telegram bot that downloads video/audio from **1000+ sites** (YouTube, TikTok, Instagram,
+Facebook, Twitter/X, Reddit, Vimeo, Dailymotion and more) powered by `yt-dlp` + `ffmpeg`.
 
 Runs **free on GitHub Actions** — no server needed, auto-restarts to stay online.
 
@@ -13,10 +13,30 @@ Runs **free on GitHub Actions** — no server needed, auto-restarts to stay onli
 - Animated progress bar while downloading
 - Bulk links (up to 5 per message)
 - Auto-compress to fit Telegram's 50 MB bot limit
-- 🍪 **Cookie support with auto-format detection** — Netscape, JSON, raw string, or base64
-- 🔒 **Auto-delete everything** — cookies wiped after 30 min, files after 10 min
-- 📊 Status panel (uptime, cookies, active jobs)
+- 🌐 **Cloudflare WARP relay** — fixes YouTube's datacenter IP block with **no cookies**
+- 🧱 **Multi-layer fallback** — 9 WARP endpoints, account re-registration, player-client rotations
+- 🔒 **Auto-delete** — downloaded files are wiped after 10 min (fresh VM each run)
+- 📊 Status panel (uptime)
 - Self-restarting worker + watchdog cron
+
+## How YouTube works without cookies
+
+Datacenter IPs (including GitHub runners) are blocked by YouTube with
+*"Sign in to confirm you're not a bot"*. Cookies used to be the only fix — but they rotate and
+break constantly.
+
+Instead the bot brings up a **Cloudflare WARP tunnel** in userspace:
+
+1. `wgcf` registers a free WARP account
+2. `wireproxy` creates a userspace WireGuard tunnel (no root, no TUN device)
+3. yt-dlp runs through a local SOCKS5 relay with a clean egress IP
+
+If a tunnel fails, the bot automatically tries **9 different WARP endpoints**, then
+**re-registers a fresh account** and tries again. If WARP is entirely unavailable, downloads
+fall back to alternate player clients and then to direct connections. A watchdog re-checks the
+proxy every 45 seconds and restarts it on failure.
+
+Verified working: **YouTube 1080p, 4K and MP3 — no cookies needed.**
 
 ## Setup
 
@@ -36,33 +56,21 @@ git push -u origin main
 |---|---|---|
 | `BOT_TOKEN` | ✅ | Telegram bot token |
 | `GH_PAT` | ✅ | PAT with `Actions: write` for self-rerun |
-| `YT_COOKIES` | ➖ | Optional cookie seed (any format) |
+| `WGCF_PROFILE` | ➖ | Optional pre-made WARP profile |
 
 ### 3. Enable Actions
 
 Actions tab → allow workflows → **Run workflow** (or wait for the cron).
-
-## Sites & cookies
-
-Runners use datacenter IPs. **The bot automatically brings up a Cloudflare WARP relay**
-(userspace WireGuard, no root needed) and routes downloads through it. This **fixes YouTube**
-without any cookies — verified at 1080p, MP3 and 4K.
-
-**TikTok, Facebook, X, Dailymotion, Streamable, YouTube** work automatically.
-**Instagram, Reddit, Vimeo** may still need cookies — the bot detects this and asks in chat.
-Send cookies in **any** format and it converts them automatically.
-
-🔒 Cookies are kept only for `COOKIE_TTL_MIN` (default 30) minutes, then wiped. Files are
-deleted after `FILE_TTL_MIN` (default 10) minutes. Each Actions run also gets a fresh VM.
 
 ## Configuration
 
 | Env var | Default | Meaning |
 |---|---|---|
 | `RUNTIME_MINUTES` | `340` | worker lifetime before self-rerun |
-| `COOKIE_TTL_MIN` | `30` | cookie auto-delete window |
 | `FILE_TTL_MIN` | `10` | file auto-delete window |
-| `YT_COOKIES` | — | optional cookie seed |
+| `WARP_ENABLE` | `1` | bring up the Cloudflare WARP relay |
+| `WARP_PROXY_PORT` | `25344` | local SOCKS5 port for the relay |
+| `WGCF_PROFILE` | — | optional pre-made WARP WireGuard profile |
 
 Agent handoff instructions live in **[AGENT.md](AGENT.md)**.
 
