@@ -1,0 +1,68 @@
+name: ReClip Telegram Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Watchdog: every 6 hours, in case a self-rerun fails
+    - cron: '17 */6 * * *'
+
+concurrency:
+  group: reclip-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  run-bot:
+    name: Run bot worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip -q
+          pip install -q -r requirements.txt
+
+      - name: Install JS runtime for yt-dlp
+        run: |
+          curl -fsSL https://deno.land/install.sh | sh -s -- -y >/dev/null 2>&1 || true
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW_FILE: bot.yml
+          RUNTIME_MINUTES: '340'
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          python bot.py
+
+      - name: Self-rerun (ensure continuous uptime)
+        if: always()
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_PAT" ]; then echo 'no GH_PAT, skipping'; exit 0; fi
+          curl -sf -X POST \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/bot.yml/dispatches" \
+            -d '{"ref":"main"}' && echo 'rerun dispatched' || echo 'rerun failed'
