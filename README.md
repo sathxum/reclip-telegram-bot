@@ -1,62 +1,66 @@
 # ReClip Telegram Bot 🤖
 
-A self-hosted Telegram bot that downloads video/audio from **1000+ sites** (TikTok, Instagram, Facebook, Twitter/X, YouTube, Reddit, Vimeo, Dailymotion and more) powered by `yt-dlp` + `ffmpeg`.
+A Telegram bot that downloads video/audio from **1000+ sites** (TikTok, Instagram, Facebook,
+Twitter/X, YouTube, Reddit, Vimeo, Dailymotion and more) powered by `yt-dlp` + `ffmpeg`.
 
-Runs **free on GitHub Actions** — no server needed. Auto-reruns itself to stay online ~24/7.
+Runs **free on GitHub Actions** — no server needed, auto-restarts to stay online.
 
 ## Features
 
 - Paste any link → get MP4 or MP3 back in chat
-- Quality picker (up to 8 resolutions) + one-tap MP3
+- Quality picker (up to 8 resolutions) + one-tap 🎵 MP3
 - Thumbnail preview with inline buttons
+- Animated progress bar while downloading
 - Bulk links (up to 5 per message)
 - Auto-compress to fit Telegram's 50 MB bot limit
-- Progress updates while downloading
-- Self-restarting: each run lasts ~5h40m, then dispatches itself again
-- Watchdog cron every 6h in case a self-restart fails
+- 🍪 **Cookie support with auto-format detection** — Netscape, JSON, raw string, or base64
+- 🔒 **Auto-delete everything** — cookies wiped after 30 min, files after 10 min
+- 📊 Status panel (uptime, cookies, active jobs)
+- Self-restarting worker + watchdog cron
 
 ## Setup
 
-The repo already ships a ready workflow at `.github/workflows/bot.yml`.
-
-### 1. Create the public repo
+### 1. Push to a repo
 
 ```bash
-git init -b main
-git add .
-git commit -m "ReClip Telegram bot"
+git init -b main && git add . && git commit -m "ReClip bot"
 git remote add origin https://github.com/<YOU>/reclip-telegram-bot.git
 git push -u origin main
 ```
 
-### 2. Add repository secrets
+### 2. Add secrets
 
-`Settings → Secrets and variables → Actions → New repository secret`
+`Settings → Secrets and variables → Actions`
 
 | Secret | Required | Purpose |
 |---|---|---|
-| `BOT_TOKEN` | ✅ | Telegram bot token from @BotFather |
-| `GH_PAT` | ✅ | Fine-grained PAT with `Actions: Read and write` so the bot can self-rerun |
-| `YT_COOKIES` | ➖ | Netscape cookies.txt content — needed for YouTube/Instagram on datacenter IPs |
+| `BOT_TOKEN` | ✅ | Telegram bot token |
+| `GH_PAT` | ✅ | PAT with `Actions: write` for self-rerun |
+| `YT_COOKIES` | ➖ | Optional cookie seed (any format) |
 
 ### 3. Enable Actions
 
-`Actions` tab → allow workflows. The bot starts on the next cron tick, or press **Run workflow**.
+Actions tab → allow workflows → **Run workflow** (or wait for the cron).
 
-## Important: datacenter IP limits
+## Sites & cookies
 
-GitHub Actions runners use datacenter IPs. Sites like **YouTube, Instagram, Reddit, Vimeo, Pinterest** may ask for login / block the request.
+Runners use datacenter IPs. **TikTok, Facebook, X, Dailymotion, Streamable** work directly.
+**YouTube, Instagram, Reddit, Vimeo, Pinterest** need cookies — the bot detects this and asks
+in chat. Send cookies in **any** format and it converts them automatically.
 
-Options:
-1. **Add `YT_COOKIES`** — export cookies from a logged-in browser with a cookie extension, paste the file contents as the secret.
-2. Accept that those sites need cookies while others (TikTok, FB, X, Dailymotion, Streamable…) work out of the box.
+🔒 Cookies are kept only for `COOKIE_TTL_MIN` (default 30) minutes, then wiped. Files are
+deleted after `FILE_TTL_MIN` (default 10) minutes. Each Actions run also gets a fresh VM.
 
-## Runtime & uptime
+## Configuration
 
-- `RUNTIME_MINUTES=340` (~5h40m), just under GitHub's 6h job cap
-- On exit the bot POSTs a `workflow_dispatch` to restart itself
-- `concurrency` group prevents two bots fighting over `getUpdates`
-- The `schedule` cron is a safety net
+| Env var | Default | Meaning |
+|---|---|---|
+| `RUNTIME_MINUTES` | `340` | worker lifetime before self-rerun |
+| `COOKIE_TTL_MIN` | `30` | cookie auto-delete window |
+| `FILE_TTL_MIN` | `10` | file auto-delete window |
+| `YT_COOKIES` | — | optional cookie seed |
+
+Agent handoff instructions live in **[AGENT.md](AGENT.md)**.
 
 ## Local test
 
