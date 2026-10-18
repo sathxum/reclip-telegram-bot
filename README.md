@@ -15,7 +15,7 @@ Runs **free on GitHub Actions** — no server needed, auto-restarts to stay onli
 - Auto-compress to fit Telegram's 50 MB bot limit
 - 🌐 **Cloudflare WARP relay** — fixes YouTube's datacenter IP block with **no cookies**
 - 🧱 **Multi-layer fallback** — 9 WARP endpoints, account re-registration, player-client rotations
-- 🔒 **Auto-delete** — downloaded files are wiped after 10 min (fresh VM each run)
+- 🔒 **Auto-delete** — downloaded files are wiped after 20 min
 - 📊 Status panel (uptime)
 - Self-restarting worker + watchdog cron
 

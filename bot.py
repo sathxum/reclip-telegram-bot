@@ -3,13 +3,15 @@
 
 - Handles 1000+ sites via yt-dlp + ffmpeg
 - Cloudflare WARP relay (userspace WireGuard) fixes YouTube's datacenter IP block
-- Multiple endpoints, automatic account re-registration, continuous watchdog
+- Downloads run in worker threads: the poll loop never blocks, so the bot stays
+  responsive during long downloads
+- Large files are always delivered: smart re-encode (with downscale) or splitting
 - Downloaded files are auto-deleted after a short TTL (fresh VM each run)
-- Animated progress and polished inline-button UI
 """
 import os
 import re
 import json
+import math
 import time
 import glob
 import random
@@ -27,7 +29,8 @@ GH_PAT = os.environ.get("GH_PAT", "").strip()
 GH_REPO = os.environ.get("GH_REPO", "").strip()
 WORKFLOW_FILE = os.environ.get("WORKFLOW_FILE", "bot.yml")
 RUNTIME_MINUTES = int(os.environ.get("RUNTIME_MINUTES", "340"))
-FILE_TTL = int(os.environ.get("FILE_TTL_MIN", "10")) * 60
+FILE_TTL = int(os.environ.get("FILE_TTL_MIN", "20")) * 60
+MAX_PAR = int(os.environ.get("MAX_PARALLEL_JOBS", "3"))
 
 if not BOT_TOKEN:
     print("FATAL: BOT_TOKEN is not set")
@@ -39,22 +42,36 @@ DL = os.path.join(WORKDIR, "downloads")
 os.makedirs(DL, exist_ok=True)
 
 TG_LIMIT = 50 * 1024 * 1024
+TG_TARGET = 45 * 1024 * 1024
 START = time.time()
 DEADLINE = START + RUNTIME_MINUTES * 60
 URL_RE = re.compile(r"https?://\S+")
 JOBS = {}
-
-BLOCK_PAT = re.compile(
-    "not a bot|sign in to confirm|login required|private video|rate.?limit|"
-    "http error 403|403 forbidden|only available|account is|age.?restricted|"
-    "this video is unavailable|blocked|consent|confirm your age|payment required",
-    re.I,
-)
+ACTIVE = set()
+_LOCK = threading.Lock()
+_SEM = threading.Semaphore(MAX_PAR)
+_DISPATCH = {"ok": False}
+_INFLIGHT_URLS = set()
 
 
 def log(*a):
     print(datetime.now().strftime("%H:%M:%S"), *a, flush=True)
 
+
+def _track(*paths):
+    with _LOCK:
+        for p in paths:
+            if p:
+                ACTIVE.add(p)
+
+
+def _untrack(*paths):
+    with _LOCK:
+        for p in paths:
+            ACTIVE.discard(p)
+
+
+# ------------------------------------------------------------ telegram api --
 
 def api(method, data=None, files=None, timeout=90):
     url = API + "/" + method
@@ -74,9 +91,9 @@ def api(method, data=None, files=None, timeout=90):
     return {"ok": False}
 
 
-def send_message(chat_id, text, markup=None, disable_preview=True):
+def send_message(chat_id, text, markup=None):
     data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-            "disable_web_page_preview": disable_preview}
+            "disable_web_page_preview": True}
     if markup:
         data["reply_markup"] = json.dumps(markup)
     return api("sendMessage", data)
@@ -130,23 +147,13 @@ def bar(pct, width=12):
 
 
 # ------------------------------------------------------------------- warp ---
-# Cloudflare WARP gives a clean egress IP that fixes YouTube's datacenter
-# block ("Sign in to confirm you're not a bot") without any cookies.
-# Userspace WireGuard (wireproxy) => no root, no TUN device needed.
-#
-# Fallback chain for maximum reliability:
-#   1. profile from env seed (WGCF_PROFILE) if provided
-#   2. existing generated profile
-#   3. freshly registered WARP account
-#   Each profile is tried against every known WARP endpoint until one tunnel
-#   comes up. A watchdog keeps re-checking and restarts on failure.
 
 WARP_ENABLED = os.environ.get("WARP_ENABLE", "1").strip().lower() not in ("0", "false", "no")
 WARP_DIR = "/tmp/warp"
 PROXY_PORT = int(os.environ.get("WARP_PROXY_PORT", "25344"))
 PROXY_URL = "socks5h://127.0.0.1:" + str(PROXY_PORT)
 WGCF_PROFILE_ENV = os.environ.get("WGCF_PROFILE", "").strip()
-PROXY_STATE = {"up": False, "ip": "", "endpoint": "", "proc": None, "fair": 0}
+PROXY_STATE = {"up": False, "ip": "", "endpoint": "", "proc": None}
 
 WGCF_URL = ("https://github.com/ViRb3/wgcf/releases/download/v2.2.29/"
             "wgcf_2.2.29_linux_amd64")
@@ -349,7 +356,6 @@ def _start_wireproxy(wp, conf_path):
 
 
 def setup_warp():
-    """Bring up the WARP SOCKS proxy with endpoint + account fallbacks."""
     if not WARP_ENABLED:
         log("warp: disabled")
         return False
@@ -357,12 +363,10 @@ def setup_warp():
     if not wgcf or not wp:
         log("warp: binaries unavailable")
         return False
-
     profiles = []
     p = _profile_path(wgcf)
     if p:
         profiles.append(p)
-
     for attempt in range(2):
         for profile in list(profiles):
             for endpoint in ENDPOINTS:
@@ -379,7 +383,6 @@ def setup_warp():
             fresh = _register_profile(wgcf)
             if fresh and fresh not in profiles:
                 profiles.append(fresh)
-
     PROXY_STATE["up"] = False
     log("warp: all attempts failed")
     return False
@@ -405,27 +408,22 @@ def warp_watchdog():
 
 # ---------------------------------------------------------------- engine ----
 
-def base_cmd(extra=None):
-    cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "--socket-timeout", "25",
-           "--retries", "5", "--fragment-retries", "10", "--no-cache-dir"]
+
+def yt_base():
+    cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "--socket-timeout", "30",
+           "--retries", "10", "--fragment-retries", "20", "--no-cache-dir"]
     if PROXY_STATE.get("up"):
         cmd += ["--proxy", PROXY_URL]
-    if extra:
-        cmd += extra
     return cmd
 
 
 def yt_info(url):
-    tries = []
-    if PROXY_STATE.get("up"):
-        tries.append(["--proxy", PROXY_URL])
-    tries.append([])
-    for extra in tries:
+    for extra in ([], ["--proxy", PROXY_URL]) if PROXY_STATE.get("up") else ([],):
         try:
             res = subprocess.run(
-                ["yt-dlp", "--no-playlist", "--no-warnings", "--socket-timeout", "25",
+                ["yt-dlp", "--no-playlist", "--no-warnings", "--socket-timeout", "30",
                  "--no-cache-dir"] + extra + ["-j", url],
-                capture_output=True, text=True, timeout=120)
+                capture_output=True, text=True, timeout=150)
         except subprocess.TimeoutExpired:
             continue
         for line in res.stdout.splitlines():
@@ -466,7 +464,7 @@ def _run_once(cmd, out_base, on_progress):
         for raw in proc.stdout:
             raw = raw.rstrip()
             m = re.search(r"\[download\]\s+([\d.]+)%", raw)
-            if m and on_progress and time.time() - t0 > 3:
+            if m and on_progress and time.time() - t0 > 4:
                 t0 = time.time()
                 try:
                     on_progress(float(m.group(1)))
@@ -492,23 +490,18 @@ def _run_once(cmd, out_base, on_progress):
 
 
 def run_download(url, opts, out_base, on_progress=None):
-    """Download with a fallback chain: WARP -> alternate client -> direct."""
     attempts = []
     if PROXY_STATE.get("up"):
-        attempts.append({"proxy": True, "client": None})
-        attempts.append({"proxy": True, "client": "default,tv,web"})
-    attempts.append({"proxy": False, "client": None})
-    attempts.append({"proxy": False, "client": "default,tv,web"})
-
+        attempts.append(["--proxy", PROXY_URL])
+        attempts.append(["--proxy", PROXY_URL,
+                         "--extractor-args", "youtube:player_client=default,tv,web"])
+    attempts.append([])
+    attempts.append(["--extractor-args", "youtube:player_client=default,tv,web"])
     last_err = ""
-    for at in attempts:
-        cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "--socket-timeout", "25",
-               "--retries", "5", "--fragment-retries", "10", "--no-cache-dir"]
-        if at["proxy"] and PROXY_STATE.get("up"):
-            cmd += ["--proxy", PROXY_URL]
-        if at["client"]:
-            cmd += ["--extractor-args", "youtube:player_client=" + at["client"]]
-        cmd += opts + ["-o", out_base + ".%(ext)s", url]
+    for extra in attempts:
+        cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "--socket-timeout", "30",
+               "--retries", "10", "--fragment-retries", "20", "--no-cache-dir"]
+        cmd += extra + opts + ["-o", out_base + ".%(ext)s", url]
         path, err = _run_once(cmd, out_base, on_progress)
         if path:
             return path, None
@@ -521,21 +514,100 @@ def run_download(url, opts, out_base, on_progress=None):
     return None, last_err
 
 
-def compress_to_fit(path, duration):
-    out = path.rsplit(".", 1)[0] + "_c.mp4"
-    dur = max(float(duration or 0), 1)
-    target_bits = (44 * 1024 * 1024) * 8
-    vbit = max(int(target_bits / dur) - 96000, 100000)
-    cmd = ["ffmpeg", "-y", "-i", path, "-c:v", "libx264", "-preset", "veryfast",
-           "-b:v", str(vbit), "-maxrate", str(int(vbit * 1.3)),
-           "-bufsize", str(vbit * 2), "-c:a", "aac", "-b:a", "96k", out]
+def _ffmpeg(args, timeout=2700):
     try:
-        subprocess.run(cmd, capture_output=True, timeout=1800)
-    except Exception:
-        return None
-    if os.path.isfile(out) and os.path.getsize(out) > 0:
-        return out
-    return None
+        r = subprocess.run(["ffmpeg", "-y"] + args, capture_output=True,
+                           timeout=timeout)
+        return r.returncode == 0
+    except Exception as exc:
+        log("ffmpeg err", exc)
+        return False
+
+
+def fit_video(path, duration, title):
+    """Guarantee delivery under Telegram's 50 MB limit.
+
+    Returns a list of file paths (1 for a re-encode, many for a split),
+    or [] on failure. Never returns oversized files.
+    """
+    size = os.path.getsize(path)
+    if size <= TG_LIMIT:
+        return [path]
+
+    dur = max(float(duration or 0), 1)
+    base = path.rsplit(".", 1)[0]
+    audio_bps = 48000
+    vbit = int((TG_TARGET * 8) / dur) - audio_bps
+    if vbit >= 300000:
+        scale = None
+    elif vbit >= 200000:
+        scale = 720
+    elif vbit >= 120000:
+        scale = 480
+    else:
+        scale = 360
+    vbit = max(vbit, 32000)
+
+    out = base + "_fit.mp4"
+    args = ["-i", path, "-c:v", "libx264", "-preset", "veryfast",
+            "-b:v", str(vbit), "-maxrate", str(int(vbit * 1.25)),
+            "-bufsize", str(vbit * 2), "-c:a", "aac", "-b:a", "48k",
+            "-movflags", "+faststart"]
+    if scale:
+        args += ["-vf", f"scale=-2:{scale}"]
+    args += [out]
+    if _ffmpeg(args) and os.path.isfile(out):
+        if os.path.getsize(out) <= TG_LIMIT:
+            return [out]
+        # still too big: split the re-encoded file
+        parts = _split(out, dur)
+        if parts:
+            return parts
+        return [out]
+
+    # re-encode failed: split the original with stream copy (fast, keeps quality)
+    parts = _split(path, dur)
+    return parts or []
+
+
+def _split(path, duration):
+    total = os.path.getsize(path)
+    if total <= TG_LIMIT:
+        return [path]
+    dur = max(float(duration or 0), 1)
+    n = max(2, int(math.ceil(total / float(TG_TARGET))))
+    seg = max(dur / n, 1)
+    base = path.rsplit(".", 1)[0]
+    pattern = base + "_p%03d.mp4"
+    for old in glob.glob(base + "_p*.mp4"):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    ok = _ffmpeg(["-i", path, "-c", "copy", "-f", "segment",
+                  "-segment_time", str(seg), "-reset_timestamps", "1", pattern])
+    if not ok:
+        return []
+    parts = sorted(glob.glob(base + "_p*.mp4"))
+    parts = [p for p in parts if os.path.getsize(p) > 1024]
+    if not parts:
+        return []
+    if max(os.path.getsize(p) for p in parts) > TG_LIMIT:
+        for p in parts:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        n2 = n + 2
+        seg2 = max(dur / n2, 1)
+        pattern2 = base + "_q%03d.mp4"
+        if _ffmpeg(["-i", path, "-c", "copy", "-f", "segment",
+                    "-segment_time", str(seg2), "-reset_timestamps", "1", pattern2]):
+            parts = sorted(glob.glob(base + "_q*.mp4"))
+            parts = [p for p in parts if 1024 < os.path.getsize(p) <= TG_LIMIT]
+        else:
+            parts = []
+    return parts
 
 
 def send_media(chat_id, path, kind, caption):
@@ -590,7 +662,7 @@ def handle_help(chat_id, message_id=None):
         "4️⃣  Your file arrives in a few seconds 🚀\n\n"
         "✨ <b>Nice to know</b>\n"
         "• Up to <b>5 links</b> per message\n"
-        "• Big files are auto-shrunk to fit Telegram\n"
+        "• Long videos are auto-shrunk or split into parts\n"
         "• Tap ❌ <b>Cancel</b> anytime\n"
         "• 🔒 Downloaded files are <b>auto-deleted</b>, nothing is kept"
     )
@@ -634,70 +706,84 @@ def handle_status(chat_id, message_id=None):
 
 # ---------------------------------------------------------------- fetching --
 
-def animate_fetch(chat_id, mid, stop):
-    frames = ["🔍", "🧩", "⚙️", "🧠", "🛰"]
+def animate(chat_id, mid, stop, frames, label):
     i = 0
     while not stop.is_set() and time.time() < DEADLINE:
         try:
-            edit_message(chat_id, mid, frames[i % len(frames)] + " <b>Fetching video info…</b>")
+            edit_message(chat_id, mid, frames[i % len(frames)] + f" <b>{label}</b>")
         except Exception:
             pass
         i += 1
-        if stop.wait(1.4):
+        if stop.wait(1.6):
             break
 
 
 def fetch_and_prompt(chat_id, url):
-    msg = send_message(chat_id, "🔍 <b>Fetching video info…</b>")
-    mid = (msg.get("result") or {}).get("message_id")
-    stop = threading.Event()
-    if mid:
-        threading.Thread(target=animate_fetch, args=(chat_id, mid, stop), daemon=True).start()
-    info, err = yt_info(url)
-    stop.set()
+    try:
+        msg = send_message(chat_id, "🔍 <b>Fetching video info…</b>")
+        mid = (msg.get("result") or {}).get("message_id")
+        stop = threading.Event()
+        if mid:
+            threading.Thread(target=animate, args=(chat_id, mid, stop,
+                             ["🔍", "🧩", "⚙️", "🧠", "🛰"], "Fetching video info…"),
+                             daemon=True).start()
+        info, err = yt_info(url)
+        stop.set()
+        if not info:
+            edit_message(chat_id, mid,
+                         "❌ <b>Couldn't read that link.</b>\n"
+                         "The site may be blocked, private or unsupported.\n\n"
+                         "<code>" + esc(url[:180]) + "</code>",
+                         {"inline_keyboard": [[{"text": "🔁 Try another", "callback_data": "back"}]]})
+            return
+        title = info.get("title") or "Untitled"
+        dur = fmt_dur(info.get("duration"))
+        uploader = info.get("uploader") or info.get("channel") or info.get("uploader_id") or ""
+        jid = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        JOBS[jid] = {"chat_id": chat_id, "url": url, "info": info, "msg_id": mid}
+        rows = []
+        for h, label in quality_options(info)[:8]:
+            rows.append([{"text": f"🎬 {label}", "callback_data": f"v:{jid}:{h}"}])
+        rows.append([{"text": "🎵 MP3 (Audio)", "callback_data": f"a:{jid}"}])
+        rows.append([{"text": "❌ Cancel", "callback_data": f"x:{jid}"}])
+        cap = f"🎞 <b>{esc(title)[:200]}</b>\n"
+        if uploader:
+            cap += f"👤 {esc(uploader)[:80]}\n"
+        cap += f"⏱ {dur}\n\n✨ <b>Choose a format below</b> 👇"
+        markup = {"inline_keyboard": rows}
+        thumb = info.get("thumbnail")
+        if thumb:
+            try:
+                r = requests.get(thumb, timeout=20)
+                if r.status_code == 200 and r.content:
+                    data = {"chat_id": chat_id, "caption": cap, "parse_mode": "HTML",
+                            "reply_markup": json.dumps(markup)}
+                    res = api("sendPhoto", data,
+                              files={"photo": ("thumb.jpg", r.content, "image/jpeg")}, timeout=60)
+                    if res.get("ok"):
+                        if mid:
+                            api("deleteMessage", {"chat_id": chat_id, "message_id": mid})
+                        return
+            except Exception:
+                pass
+        edit_message(chat_id, mid, cap, markup)
+    except Exception as exc:
+        log("fetch exc", exc)
+    finally:
+        with _LOCK:
+            _INFLIGHT_URLS.discard(url)
 
-    if not info:
-        edit_message(chat_id, mid,
-                     "❌ <b>Couldn't read that link.</b>\n"
-                     "The site may be blocked, private or unsupported.\n\n"
-                     "<code>" + esc(url[:180]) + "</code>",
-                     {"inline_keyboard": [[{"text": "🔁 Try another", "callback_data": "back"}]]})
-        return
 
-    title = info.get("title") or "Untitled"
-    dur = fmt_dur(info.get("duration"))
-    uploader = info.get("uploader") or info.get("channel") or info.get("uploader_id") or ""
-    jid = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
-    JOBS[jid] = {"chat_id": chat_id, "url": url, "info": info, "msg_id": mid}
+# --------------------------------------------------------------- delivering --
 
-    rows = []
-    for h, label in quality_options(info)[:8]:
-        rows.append([{"text": f"🎬 {label}", "callback_data": f"v:{jid}:{h}"}])
-    rows.append([{"text": "🎵 MP3 (Audio)", "callback_data": f"a:{jid}"}])
-    rows.append([{"text": "❌ Cancel", "callback_data": f"x:{jid}"}])
-
-    cap = f"🎞 <b>{esc(title)[:200]}</b>\n"
-    if uploader:
-        cap += f"👤 {esc(uploader)[:80]}\n"
-    cap += f"⏱ {dur}\n\n✨ <b>Choose a format below</b> 👇"
-    markup = {"inline_keyboard": rows}
-
-    thumb = info.get("thumbnail")
-    if thumb:
-        try:
-            r = requests.get(thumb, timeout=20)
-            if r.status_code == 200 and r.content:
-                data = {"chat_id": chat_id, "caption": cap, "parse_mode": "HTML",
-                        "reply_markup": json.dumps(markup)}
-                res = api("sendPhoto", data,
-                          files={"photo": ("thumb.jpg", r.content, "image/jpeg")}, timeout=60)
-                if res.get("ok"):
-                    if mid:
-                        api("deleteMessage", {"chat_id": chat_id, "message_id": mid})
-                    return
-        except Exception:
-            pass
-    edit_message(chat_id, mid, cap, markup)
+def deliver_thread(chat_id, jid, mode, height, cb_id):
+    _SEM.acquire()
+    try:
+        deliver(chat_id, jid, mode, height, cb_id)
+    except Exception as exc:
+        log("deliver exc", exc)
+    finally:
+        _SEM.release()
 
 
 def deliver(chat_id, jid, mode, height=None, cb_id=None):
@@ -715,7 +801,8 @@ def deliver(chat_id, jid, mode, height=None, cb_id=None):
     out_base = os.path.join(DL, f"{jid}_{safe}")
 
     if mode == "audio":
-        opts = ["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "0"]
+        opts = ["-f", "bestaudio/best", "-x", "--audio-format", "mp3",
+                "--audio-quality", "96K"]
         kind = "audio"
     else:
         sel = (f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
@@ -725,10 +812,11 @@ def deliver(chat_id, jid, mode, height=None, cb_id=None):
 
     if cb_id:
         answer_cb(cb_id, "🚀 Download started…")
+    cancel_btn = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"x:{jid}"}]]}
     if mid:
         edit_message(chat_id, mid,
                      f"🚀 <b>Starting download…</b>\n🎞 {esc(title)[:120]}\n\n▱▱▱▱▱▱▱▱▱▱▱▱  0%",
-                     {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"x:{jid}"}]]})
+                     cancel_btn)
     chat_action(chat_id, "upload_video" if kind == "video" else "upload_voice")
 
     counter = {"n": 0}
@@ -738,7 +826,8 @@ def deliver(chat_id, jid, mode, height=None, cb_id=None):
         if counter["n"] % 2 == 0 and mid:
             edit_message(chat_id, mid,
                          f"⬇️ <b>Downloading…</b>\n{bar(pct)}\n🎞 {esc(title)[:100]}",
-                         {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"x:{jid}"}]]})
+                         cancel_btn)
+            chat_action(chat_id, "upload_video" if kind == "video" else "upload_voice")
 
     path, err = run_download(url, opts, out_base, on_prog)
     if not path:
@@ -748,36 +837,67 @@ def deliver(chat_id, jid, mode, height=None, cb_id=None):
                          {"inline_keyboard": [[{"text": "🔁 Retry", "callback_data": f"v:{jid}:0"}]]})
         return
 
+    _track(path)
     size = os.path.getsize(path)
-    if size > TG_LIMIT and kind == "video":
-        if mid:
-            edit_message(chat_id, mid, "🛠 <b>File is large — compressing to fit Telegram…</b> ⏳", None)
-        comp = compress_to_fit(path, dur)
-        if comp:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-            path = comp
-            size = os.path.getsize(path)
+    parts = [path]
 
     if size > TG_LIMIT:
+        if kind == "video":
+            if mid:
+                edit_message(chat_id, mid,
+                             f"🛠 <b>File is {fmt_size(size)}.</b>\n"
+                             "Optimising it to fit Telegram (50&nbsp;MB)… ⏳",
+                             cancel_btn)
+            stop = threading.Event()
+            if mid:
+                threading.Thread(target=animate, args=(chat_id, mid, stop,
+                                 ["🛠", "🎛", "📦", "⏳"], "Optimising…"),
+                                 daemon=True).start()
+            parts = fit_video(path, dur, title)
+            stop.set()
+            for p in parts:
+                _track(p)
+        else:
+            parts = []
+
+    if not parts:
         if mid:
             edit_message(chat_id, mid,
-                         f"⚠️ <b>File is {fmt_size(size)}</b> — over Telegram's 50 MB bot limit "
-                         "and couldn't be shrunk.\n\nTry a lower quality or MP3 🎵",
+                         "⚠️ <b>File is too large for Telegram's 50 MB bot limit.</b>\n"
+                         "Try a lower quality or MP3 🎵",
                          {"inline_keyboard": [[{"text": "🎵 Get MP3", "callback_data": f"a:{jid}"}]]})
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        _cleanup([path])
         return
 
-    if mid:
-        edit_message(chat_id, mid, f"⬆️ <b>Uploading {fmt_size(size)}…</b>\n🎞 {esc(title)[:120]}", None)
-    cap = f"🎞 <b>{esc(title)[:200]}</b>\n⏱ {fmt_dur(dur)} • {fmt_size(size)}"
-    ok, size = send_media(chat_id, path, kind, cap)
-    if ok:
+    total = len(parts)
+    sent = 0
+    for idx, p in enumerate(parts, 1):
+        try:
+            psize = os.path.getsize(p)
+        except OSError:
+            break
+        if psize > TG_LIMIT:
+            continue
+        if mid:
+            head = f"({idx}/{total}) " if total > 1 else ""
+            edit_message(chat_id, mid,
+                         f"⬆️ <b>Uploading {head}{fmt_size(psize)}…</b>\n🎞 {esc(title)[:120]}", None)
+        cap = f"🎞 <b>{esc(title)[:180]}</b>\n⏱ {fmt_dur(dur)} • {fmt_size(psize)}"
+        if total > 1:
+            cap += f"\n📦 Part <b>{idx}</b> of <b>{total}</b>"
+        chat_action(chat_id, "upload_video" if kind == "video" else "upload_voice")
+        ok, _ = send_media(chat_id, p, kind, cap)
+        if ok:
+            sent += 1
+        else:
+            log("upload failed", p, fmt_size(psize))
+        time.sleep(1.5)
+
+    if total > 1 and "_p" in parts[0] or (total > 1 and "_q" in parts[0]):
+        # split parts keep the original too; nothing extra to announce
+        pass
+
+    if sent:
         if mid:
             try:
                 api("deleteMessage", {"chat_id": chat_id, "message_id": mid})
@@ -785,11 +905,18 @@ def deliver(chat_id, jid, mode, height=None, cb_id=None):
                 pass
     else:
         if mid:
-            edit_message(chat_id, mid, "❌ <b>Upload failed</b> — file may be too large.", None)
-    try:
-        os.remove(path)
-    except OSError:
-        pass
+            edit_message(chat_id, mid, "❌ <b>Upload failed</b> — please try again.", None)
+    _cleanup(parts + [path])
+
+
+def _cleanup(paths):
+    for p in paths:
+        _untrack(p)
+        try:
+            if p and os.path.isfile(p):
+                os.remove(p)
+        except OSError:
+            pass
 
 
 # ------------------------------------------------------------------- loop ---
@@ -803,7 +930,6 @@ def handle_update(upd):
             return
         name = chat.get("first_name") or chat.get("title") or "there"
         text = m.get("text") or m.get("caption") or ""
-
         if text.startswith("/start"):
             handle_start(chat_id, name)
             return
@@ -816,7 +942,6 @@ def handle_update(upd):
         if text.startswith("/status"):
             handle_status(chat_id)
             return
-
         urls = [u.rstrip(".,);]") for u in URL_RE.findall(text)]
         if urls:
             seen = []
@@ -824,9 +949,13 @@ def handle_update(upd):
                 if u not in seen:
                     seen.append(u)
             for u in seen:
-                fetch_and_prompt(chat_id, u)
+                with _LOCK:
+                    if u in _INFLIGHT_URLS:
+                        continue
+                    _INFLIGHT_URLS.add(u)
+                threading.Thread(target=fetch_and_prompt, args=(chat_id, u),
+                                 daemon=True).start()
             return
-
         if text:
             send_message(chat_id, "🔗 <b>Send me a video link</b> and I'll download it for you! 🎬",
                          main_menu())
@@ -854,9 +983,15 @@ def handle_update(upd):
         elif data.startswith("v:"):
             parts = data.split(":")
             height = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() and int(parts[2]) > 0 else None
-            deliver(chat_id, parts[1], "video", height, cb_id)
+            answer_cb(cb_id, "🚀 Download started…")
+            threading.Thread(target=deliver_thread,
+                             args=(chat_id, parts[1], "video", height, None),
+                             daemon=True).start()
         elif data.startswith("a:"):
-            deliver(chat_id, data.split(":", 1)[1], "audio", None, cb_id)
+            answer_cb(cb_id, "🚀 Download started…")
+            threading.Thread(target=deliver_thread,
+                             args=(chat_id, data.split(":", 1)[1], "audio", None, None),
+                             daemon=True).start()
         elif data.startswith("x:"):
             answer_cb(cb_id, "Cancelled")
             if mid:
@@ -868,12 +1003,20 @@ def handle_update(upd):
 
 def janitor_loop():
     while time.time() < DEADLINE + 120:
-        time.sleep(45)
+        time.sleep(60)
         now = time.time()
         try:
+            with _LOCK:
+                active = set(ACTIVE)
             for f in glob.glob(os.path.join(DL, "*")):
                 try:
-                    if os.path.isfile(f) and (now - os.path.getmtime(f)) > FILE_TTL:
+                    if not os.path.isfile(f):
+                        continue
+                    if f in active:
+                        continue
+                    if f.endswith((".part", ".ytdl")):
+                        continue
+                    if (now - os.path.getmtime(f)) > FILE_TTL:
                         os.remove(f)
                 except OSError:
                     pass
@@ -886,20 +1029,38 @@ def janitor_loop():
 def trigger_rerun():
     if not GH_PAT or not GH_REPO or "/" not in GH_REPO:
         log("rerun skipped (no GH_PAT/GH_REPO)")
-        return
+        return False
     url = ("https://api.github.com/repos/" + GH_REPO +
            "/actions/workflows/" + WORKFLOW_FILE + "/dispatches")
     headers = {"Authorization": "Bearer " + GH_PAT, "Accept": "application/vnd.github+json"}
-    try:
-        r = requests.post(url, json={"ref": "main"}, headers=headers, timeout=30)
-        log("rerun status", r.status_code)
-    except Exception as exc:
-        log("rerun exc", exc)
+    for _ in range(3):
+        try:
+            r = requests.post(url, json={"ref": "main"}, headers=headers, timeout=30)
+            log("rerun status", r.status_code)
+            if r.status_code in (204, 201, 200):
+                _DISPATCH["ok"] = True
+                return True
+        except Exception as exc:
+            log("rerun exc", exc)
+        time.sleep(5)
+    return False
+
+
+def rerun_scheduler():
+    """Dispatch the next run BEFORE this one ends, so there is no dead gap."""
+    target = DEADLINE - 240
+    delay = max(0, target - time.time())
+    if delay:
+        time.sleep(delay)
+    if not _DISPATCH["ok"]:
+        trigger_rerun()
 
 
 def main():
-    log("bot starting | runtime", RUNTIME_MINUTES, "min | warp:", WARP_ENABLED)
+    log("bot starting | runtime", RUNTIME_MINUTES, "min | warp:", WARP_ENABLED,
+        "| parallel:", MAX_PAR)
     threading.Thread(target=janitor_loop, daemon=True).start()
+    threading.Thread(target=rerun_scheduler, daemon=True).start()
     ok = setup_warp()
     if WARP_ENABLED:
         threading.Thread(target=warp_watchdog, daemon=True).start()
@@ -929,7 +1090,8 @@ def main():
             time.sleep(3)
     log("runtime budget reached, exiting")
     _kill_proxy()
-    trigger_rerun()
+    if not _DISPATCH["ok"]:
+        trigger_rerun()
 
 
 if __name__ == "__main__":

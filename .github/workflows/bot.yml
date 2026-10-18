@@ -51,7 +51,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
           WORKFLOW_FILE: bot.yml
           RUNTIME_MINUTES: '340'
-          FILE_TTL_MIN: '10'
+          FILE_TTL_MIN: '20'
+          MAX_PARALLEL_JOBS: '3'
           WARP_ENABLE: '1'
           WGCF_PROFILE: ${{ secrets.WGCF_PROFILE }}
         run: |
