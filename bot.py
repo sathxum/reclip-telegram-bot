@@ -288,11 +288,240 @@ if os.environ.get("YT_COOKIES", "").strip():
     log("seeded cookies from env:", _seeded)
 
 
+# ------------------------------------------------------------------- warp ---
+# Cloudflare WARP gives a clean egress IP that fixes YouTube's datacenter
+# block ("Sign in to confirm you're not a bot") without cookies.
+# Uses userspace WireGuard (wireproxy) => no root, no TUN device required.
+
+WARP_ENABLED = os.environ.get("WARP_ENABLE", "1").strip().lower() not in ("0", "false", "no")
+WARP_DIR = "/tmp/warp"
+PROXY_PORT = int(os.environ.get("WARP_PROXY_PORT", "25344"))
+PROXY_URL = "socks5h://127.0.0.1:" + str(PROXY_PORT)
+WGCF_PROFILE_ENV = os.environ.get("WGCF_PROFILE", "").strip()
+PROXY_STATE = {"up": False, "ip": "", "proc": None}
+
+WGCF_URL = ("https://github.com/ViRb3/wgcf/releases/download/v2.2.29/"
+            "wgcf_2.2.29_linux_amd64")
+WIREPROXY_URL = ("https://github.com/pufferffish/wireproxy/releases/download/"
+                 "v1.0.9/wireproxy_linux_amd64.tar.gz")
+
+
+def _http_get(url, timeout=120):
+    for _ in range(2):
+        try:
+            r = requests.get(url, timeout=timeout, stream=True)
+            if r.status_code == 200:
+                return r
+        except Exception as exc:
+            log("get err", url[:50], exc)
+            time.sleep(2)
+    return None
+
+
+def _download(url, dest):
+    r = _http_get(url)
+    if not r:
+        return False
+    try:
+        with open(dest, "wb") as fh:
+            for chunk in r.iter_content(65536):
+                if chunk:
+                    fh.write(chunk)
+        return os.path.getsize(dest) > 0
+    except Exception as exc:
+        log("save err", dest, exc)
+        return False
+
+
+def _parse_wg_conf(text):
+    sect = None
+    out = {"Interface": {}, "Peer": {}}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            sect = line[1:-1]
+            continue
+        if sect in out and "=" in line:
+            k, v = line.split("=", 1)
+            out[sect][k.strip()] = v.strip()
+    return out
+
+
+def _proxy_alive():
+    try:
+        r = requests.get("https://www.cloudflare.com/cdn-cgi/trace",
+                         proxies={"https": PROXY_URL, "http": PROXY_URL}, timeout=15)
+        if r.status_code == 200:
+            for line in r.text.splitlines():
+                if line.startswith("ip="):
+                    PROXY_STATE["ip"] = line[3:].strip()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _ensure_binaries():
+    os.makedirs(WARP_DIR, exist_ok=True)
+    wgcf = os.path.join(WARP_DIR, "wgcf")
+    wp = os.path.join(WARP_DIR, "wireproxy")
+    if not os.path.isfile(wgcf):
+        if not _download(WGCF_URL, wgcf):
+            return None, None
+        os.chmod(wgcf, 0o755)
+    if not os.path.isfile(wp):
+        tgz = os.path.join(WARP_DIR, "wp.tgz")
+        if not _download(WIREPROXY_URL, tgz):
+            return None, None
+        try:
+            import tarfile
+            with tarfile.open(tgz) as tf:
+                for m in tf.getmembers():
+                    if m.name.endswith("wireproxy") and m.isfile():
+                        m.name = "wireproxy"
+                        tf.extract(m, WARP_DIR)
+        except Exception as exc:
+            log("untar err", exc)
+            return None, None
+        if not os.path.isfile(wp):
+            return None, None
+        os.chmod(wp, 0o755)
+    return wgcf, wp
+
+
+def _ensure_profile(wgcf):
+    conf_path = os.path.join(WARP_DIR, "wgcf-profile.conf")
+    if WGCF_PROFILE_ENV:
+        try:
+            with open(conf_path, "w") as fh:
+                fh.write(WGCF_PROFILE_ENV)
+            return conf_path
+        except Exception as exc:
+            log("profile write err", exc)
+    if os.path.isfile(conf_path):
+        return conf_path
+    try:
+        subprocess.run([wgcf, "register", "--accept-tos"], cwd=WARP_DIR,
+                       capture_output=True, text=True, timeout=150)
+        subprocess.run([wgcf, "generate"], cwd=WARP_DIR,
+                       capture_output=True, text=True, timeout=150)
+    except Exception as exc:
+        log("wgcf err", exc)
+    return conf_path if os.path.isfile(conf_path) else None
+
+
+def _write_wp_conf(profile_path):
+    try:
+        raw = open(profile_path).read()
+    except Exception:
+        return None
+    d = _parse_wg_conf(raw)
+    iface = d.get("Interface") or {}
+    peer = d.get("Peer") or {}
+    if not iface.get("PrivateKey") or not peer.get("PublicKey"):
+        return None
+    addr = "172.16.0.2/32"
+    for part in (iface.get("Address") or "").split(","):
+        part = part.strip()
+        if "/" in part and ":" not in part:
+            addr = part
+            break
+    lines = [
+        "[Interface]",
+        "PrivateKey = " + iface["PrivateKey"],
+        "Address = " + addr,
+        "DNS = 1.1.1.1",
+        "MTU = " + (iface.get("MTU") or "1280"),
+        "",
+        "[Peer]",
+        "PublicKey = " + peer["PublicKey"],
+    ]
+    if peer.get("PresharedKey"):
+        lines.append("PresharedKey = " + peer["PresharedKey"])
+    lines += [
+        "AllowedIPs = 0.0.0.0/0",
+        "Endpoint = " + (peer.get("Endpoint") or "engage.cloudflareclient.com:2408"),
+        "",
+        "[Socks5]",
+        "BindAddress = 127.0.0.1:" + str(PROXY_PORT),
+        "",
+    ]
+    path = os.path.join(WARP_DIR, "wireproxy.conf")
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines))
+    return path
+
+
+def _start_wireproxy(wp, conf_path):
+    try:
+        old = PROXY_STATE.get("proc")
+        if old and old.poll() is None:
+            old.terminate()
+    except Exception:
+        pass
+    try:
+        logf = open(os.path.join(WARP_DIR, "wireproxy.log"), "ab")
+        proc = subprocess.Popen([wp, "-c", conf_path], stdout=logf,
+                                stderr=subprocess.STDOUT)
+        PROXY_STATE["proc"] = proc
+    except Exception as exc:
+        log("wireproxy start err", exc)
+        return False
+    for _ in range(15):
+        time.sleep(2)
+        if _proxy_alive():
+            return True
+    return False
+
+
+def setup_warp():
+    """Bring up the WARP SOCKS proxy. Returns True on success."""
+    if not WARP_ENABLED:
+        log("warp: disabled")
+        return False
+    wgcf, wp = _ensure_binaries()
+    if not wgcf or not wp:
+        log("warp: binaries unavailable")
+        return False
+    profile = _ensure_profile(wgcf)
+    if not profile:
+        log("warp: no profile")
+        return False
+    conf = _write_wp_conf(profile)
+    if not conf:
+        log("warp: bad profile")
+        return False
+    ok = _start_wireproxy(wp, conf)
+    PROXY_STATE["up"] = ok
+    if ok:
+        log("warp: up, egress ip", PROXY_STATE["ip"])
+    else:
+        log("warp: proxy did not come up")
+    return ok
+
+
+def warp_watchdog():
+    if not WARP_ENABLED:
+        return
+    setup_warp()
+    while time.time() < DEADLINE + 120:
+        time.sleep(60)
+        if PROXY_STATE["up"] and not _proxy_alive():
+            log("warp: proxy lost, restarting")
+            PROXY_STATE["up"] = False
+        if not PROXY_STATE["up"]:
+            setup_warp()
+
+
 # ---------------------------------------------------------------- engine ----
 
 def base_cmd(extra=None):
     cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "--socket-timeout", "20",
            "--retries", "3", "--no-cache-dir"]
+    if PROXY_STATE.get("up"):
+        cmd += ["--proxy", PROXY_URL]
     if cookie_valid():
         cmd += ["--cookies", COOKIE_FILE]
     if extra:
@@ -522,11 +751,18 @@ def handle_status(chat_id, message_id=None):
     up = fmt_dur(time.time() - START)
     left = fmt_dur(max(0, DEADLINE - time.time()))
     ck = f"✅ {COOKIE_META['n']} active" if cookie_valid() else "❌ none"
+    if PROXY_STATE.get("up"):
+        net = f"🟢 WARP relay ({PROXY_STATE.get('ip') or 'online'})"
+    elif WARP_ENABLED:
+        net = "🟡 connecting / direct"
+    else:
+        net = "⚪ direct"
     text = (
         "📊 <b>Bot status</b>\n"
         "━━━━━━━━━━━━━━━\n\n"
         f"🟢 Uptime: <b>{up}</b>\n"
         f"⏳ Next auto-restart in: <b>{left}</b>\n"
+        f"🌐 Network: {net}\n"
         f"🍪 Cookies: {ck}\n"
         f"🎯 Active jobs: <b>{len(JOBS)}</b>"
     )
@@ -888,8 +1124,13 @@ def trigger_rerun():
 
 
 def main():
-    log("bot starting | runtime", RUNTIME_MINUTES, "min | cookies:", cookie_valid())
+    log("bot starting | runtime", RUNTIME_MINUTES, "min | cookies:", cookie_valid(),
+        "| warp:", WARP_ENABLED)
     threading.Thread(target=janitor_loop, daemon=True).start()
+    warp_ok = setup_warp()
+    if WARP_ENABLED:
+        threading.Thread(target=warp_watchdog, daemon=True).start()
+    log("warp ready:", warp_ok, "| egress:", PROXY_STATE.get("ip") or "direct")
     me = api("getMe")
     log("getMe:", (me.get("result") or {}).get("username"))
     try:

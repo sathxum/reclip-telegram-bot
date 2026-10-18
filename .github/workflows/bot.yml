@@ -53,7 +53,9 @@ jobs:
           RUNTIME_MINUTES: '340'
           COOKIE_TTL_MIN: '30'
           FILE_TTL_MIN: '10'
+          WARP_ENABLE: '1'
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
+          WGCF_PROFILE: ${{ secrets.WGCF_PROFILE }}
         run: |
           python bot.py
 

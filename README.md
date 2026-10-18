@@ -44,9 +44,13 @@ Actions tab → allow workflows → **Run workflow** (or wait for the cron).
 
 ## Sites & cookies
 
-Runners use datacenter IPs. **TikTok, Facebook, X, Dailymotion, Streamable** work directly.
-**YouTube, Instagram, Reddit, Vimeo, Pinterest** need cookies — the bot detects this and asks
-in chat. Send cookies in **any** format and it converts them automatically.
+Runners use datacenter IPs. **The bot automatically brings up a Cloudflare WARP relay**
+(userspace WireGuard, no root needed) and routes downloads through it. This **fixes YouTube**
+without any cookies — verified at 1080p, MP3 and 4K.
+
+**TikTok, Facebook, X, Dailymotion, Streamable, YouTube** work automatically.
+**Instagram, Reddit, Vimeo** may still need cookies — the bot detects this and asks in chat.
+Send cookies in **any** format and it converts them automatically.
 
 🔒 Cookies are kept only for `COOKIE_TTL_MIN` (default 30) minutes, then wiped. Files are
 deleted after `FILE_TTL_MIN` (default 10) minutes. Each Actions run also gets a fresh VM.

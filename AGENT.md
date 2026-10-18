@@ -158,14 +158,18 @@ Success = run `in_progress` with step **"Run bot"** running, and `getMe` returns
 | `COOKIE_TTL_MIN` | `30` | cookie auto-delete window |
 | `FILE_TTL_MIN` | `10` | downloaded-file auto-delete window |
 | `YT_COOKIES` | — | optional cookie seed (any format) |
+| `WARP_ENABLE` | `1` | bring up Cloudflare WARP relay (fixes YouTube) |
+| `WARP_PROXY_PORT` | `25344` | local SOCKS5 port for the WARP relay |
+| `WGCF_PROFILE` | — | optional pre-made WARP WireGuard profile |
 
 ---
 
 ## 9. Behaviour notes / gotchas
 
-- **YouTube & Instagram are IP-blocked on datacenter runners.** All player-client, PO-token,
-  JS-runtime and IPv4 tricks were tried and failed. **Only cookies work.** The bot detects the
-  block and asks the user for cookies automatically.
+- **YouTube is fixed by Cloudflare WARP.** Datacenter IPs get "Sign in to confirm you're not a
+  bot". The bot starts a userspace WireGuard (wireproxy + wgcf) SOCKS5 relay on boot and routes
+  yt-dlp through it. Verified working with **no cookies**: 1080p, MP3 and 4K formats all download.
+  Cookies remain a fallback for Instagram/Reddit/Vimeo or if WARP is unavailable.
 - **Only one worker may run at once** — Telegram allows a single `getUpdates` consumer.
   The workflow uses a `concurrency` group to enforce this.
 - **Cookies & files are ephemeral by design.** A janitor thread wipes cookies after
