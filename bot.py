@@ -361,37 +361,60 @@ def _start_wireproxy(wp, conf_path):
     return False
 
 
+WARP_ROUNDS = int(os.environ.get('WARP_ROUNDS', '4'))
+_WARP_SETUP_LOCK = threading.Lock()
+
+
 def setup_warp():
     if not WARP_ENABLED:
         log("warp: disabled")
         return False
-    wgcf, wp = _ensure_binaries()
-    if not wgcf or not wp:
-        log("warp: binaries unavailable")
-        return False
-    profiles = []
-    p = _profile_path(wgcf)
-    if p:
-        profiles.append(p)
-    for attempt in range(2):
-        for profile in list(profiles):
-            for endpoint in ENDPOINTS:
-                conf = _write_wp_conf(profile, endpoint)
-                if not conf:
-                    continue
-                if _start_wireproxy(wp, conf):
-                    PROXY_STATE.update({"up": True, "endpoint": endpoint})
-                    log("warp: up via", endpoint, "| egress", PROXY_STATE["ip"])
-                    return True
-                log("warp: endpoint failed:", endpoint)
-        if attempt == 0:
-            log("warp: re-registering a fresh account")
+    with _WARP_SETUP_LOCK:
+        if PROXY_STATE.get("up") and _proxy_check():
+            return True
+        wgcf, wp = _ensure_binaries()
+        if not wgcf or not wp:
+            log("warp: binaries unavailable")
+            return False
+        profiles = []
+        p = _profile_path(wgcf)
+        if p:
+            profiles.append(p)
+        for attempt in range(WARP_ROUNDS):
+            order = list(ENDPOINTS)
+            random.shuffle(order)
+            for profile in list(profiles):
+                for endpoint in order:
+                    conf = _write_wp_conf(profile, endpoint)
+                    if not conf:
+                        continue
+                    if _start_wireproxy(wp, conf):
+                        PROXY_STATE.update({"up": True, "endpoint": endpoint})
+                        log("warp: up via", endpoint, "| egress", PROXY_STATE["ip"],
+                            "| round", attempt + 1)
+                        return True
+            # every round, try a brand-new account + re-download binaries
+            log("warp: round", attempt + 1, "failed - re-registering fresh account")
             fresh = _register_profile(wgcf)
             if fresh and fresh not in profiles:
                 profiles.append(fresh)
+            wgcf2, wp2 = _ensure_binaries()
+            if wgcf2 and wp2:
+                wgcf, wp = wgcf2, wp2
+            time.sleep(3)
+        PROXY_STATE["up"] = False
+        log("warp: all attempts failed")
+        return False
+
+
+def ensure_warp():
+    """Best-effort: guarantee a working WARP egress before a critical yt-dlp call."""
+    if not WARP_ENABLED:
+        return False
+    if PROXY_STATE.get("up") and _proxy_check():
+        return True
     PROXY_STATE["up"] = False
-    log("warp: all attempts failed")
-    return False
+    return setup_warp()
 
 
 def warp_watchdog():
@@ -679,14 +702,19 @@ def expiry_loop():
 
 
 def _tunnel_msg(chat_id, mid, link, title, size, dur):
-    text = ('\u2705 <b>Ready — full quality!</b>\n'
-            '━━━━━━━━━━━━━━━\n'
+    text = ('╔══════════════════════╗\n'
+            '     💎  <b>F U L L  Q U A L I T Y</b>\n'
+            '╚══════════════════════╝\n\n'
             '🎞 <b>' + esc(title)[:180] + '</b>\n'
-            '📦 ' + fmt_size(size) + ' • \u23f1 ' + fmt_dur(dur) + '\n\n'
-            '\u25b6\ufe0f <b>Play or download</b> (original quality, no compression):\n'
+            '━━━━━━━━━━━━━━━\n'
+            '📦 <b>' + fmt_size(size) + '</b>  •  \u23f1 <b>' + fmt_dur(dur) + '</b>\n'
+            '💠 Original quality — <b>no compression</b>\n\n'
+            '\u25b6\ufe0f <b>Play</b> in your browser, or hit <b>Download</b>:\n'
             '<a href="' + link + '">' + link + '</a>\n\n'
-            '\u23f3 This link self-destructs in ' + str(TUNNEL_TTL // 60) + ' min.\n'
-            '\U0001f512 Private single-file link. Nothing else is exposed.')
+            '━━━━━━━━━━━━━━━\n'
+            '\u23f3 Self-destructs in <b>' + str(TUNNEL_TTL // 60) + ' min</b>\n'
+            '\U0001f512 Private single-file link — nothing else exposed\n'
+            '🧹 File securely wiped after expiry')
     markup = {'inline_keyboard': [[{'text': '\u25b6\ufe0f Play / Download', 'url': link}]]}
     if mid:
         edit_message(chat_id, mid, text, markup)
@@ -832,22 +860,48 @@ def yt_base():
     return cmd
 
 
+PLAYER_CLIENTS = ["default", "tv", "web", "android", "ios", "mweb",
+                  "tv_embedded", "web_safari", "android_vr", "web_embedded"]
+
+
+def _yt_json(url, extra, timeout=150):
+    try:
+        res = subprocess.run(
+            ["yt-dlp", "--no-playlist", "--no-warnings", "--socket-timeout", "30",
+             "--no-cache-dir"] + extra + ["-j", url],
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except Exception:
+                continue
+    return None
+
+
 def yt_info(url):
-    for extra in ([], ["--proxy", PROXY_URL]) if PROXY_STATE.get("up") else ([],):
-        try:
-            res = subprocess.run(
-                ["yt-dlp", "--no-playlist", "--no-warnings", "--socket-timeout", "30",
-                 "--no-cache-dir"] + extra + ["-j", url],
-                capture_output=True, text=True, timeout=150)
-        except subprocess.TimeoutExpired:
-            continue
-        for line in res.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    return json.loads(line), None
-                except Exception:
-                    continue
+    """Try hard: WARP egress first, then a rotation of player clients, then direct.
+
+    The point is to survive 'Sign in to confirm you're not a bot' and transient
+    network hiccups without the user ever seeing a failure.
+    """
+    prox = PROXY_STATE.get("up")
+    strategies = []
+    if prox:
+        strategies.append(["--proxy", PROXY_URL])
+        for pc in PLAYER_CLIENTS:
+            strategies.append(["--proxy", PROXY_URL,
+                               "--extractor-args", "youtube:player_client=" + pc])
+    for pc in PLAYER_CLIENTS:
+        strategies.append(["--extractor-args", "youtube:player_client=" + pc])
+    strategies.append([])
+    for extra in strategies:
+        info = _yt_json(url, extra)
+        if info:
+            return info, None
     return None, "unavailable"
 
 
@@ -905,13 +959,22 @@ def _run_once(cmd, out_base, on_progress):
 
 
 def run_download(url, opts, out_base, on_progress=None):
+    # make sure the WARP relay is up (best-effort) so YouTube works
+    if WARP_ENABLED and not PROXY_STATE.get("up"):
+        try:
+            setup_warp()
+        except Exception:
+            pass
+
     attempts = []
     if PROXY_STATE.get("up"):
         attempts.append(["--proxy", PROXY_URL])
-        attempts.append(["--proxy", PROXY_URL,
-                         "--extractor-args", "youtube:player_client=default,tv,web"])
+        for pc in PLAYER_CLIENTS:
+            attempts.append(["--proxy", PROXY_URL,
+                             "--extractor-args", "youtube:player_client=" + pc])
+    for pc in PLAYER_CLIENTS:
+        attempts.append(["--extractor-args", "youtube:player_client=" + pc])
     attempts.append([])
-    attempts.append(["--extractor-args", "youtube:player_client=default,tv,web"])
     last_err = ""
     for extra in attempts:
         cmd = ["yt-dlp", "--no-playlist", "--no-warnings", "--socket-timeout", "30",
@@ -1046,46 +1109,61 @@ def send_media(chat_id, path, kind, caption):
 
 def main_menu(chat_id=None):
     rows = [
-        [{"text": "🎞 How to use", "callback_data": "help"},
-         {"text": "ℹ️ About", "callback_data": "about"}],
-        [{"text": "📊 Status", "callback_data": "status"}],
+        [{"text": "🎬 How to use", "callback_data": "help"},
+         {"text": "💎 About", "callback_data": "about"}],
+        [{"text": "📊 Live status", "callback_data": "status"}],
     ]
     if chat_id is not None and is_admin(chat_id):
-        rows.append([{"text": "🛡 Admin", "callback_data": "admin"}])
+        rows.append([{"text": "🛡 Admin Panel", "callback_data": "admin"}])
     return {"inline_keyboard": rows}
 
 
+WELCOME = (
+    "╔══════════════════════╗\n"
+    "     🎬  <b>R E C L I P</b>  🎬\n"
+    "╚══════════════════════╝\n"
+    "<i>Premium video &amp; audio downloader</i>\n\n"
+    "👋 <b>Welcome, {name}!</b>\n"
+    "<i>Download as much as you want — until my server's cooked. No limit.</i> 🔥\n\n"
+    "━━━━━━━━━━━━━━━\n"
+    "⚡ <b>How it works</b>\n"
+    "╰ 🔗 Send me <b>any link</b>\n"
+    "╰ 💠 Pick your <b>quality</b> or 🎵 <b>MP3</b>\n"
+    "╰ 🚀 Get it back in seconds\n\n"
+    "━━━━━━━━━━━━━━━\n"
+    "🌟 <b>Why ReClip is different</b>\n"
+    "╰ 💎 <b>Any size</b> — 1-hour &amp; 4K, full quality, no 50 MB cap\n"
+    "╰ 🎞 Big files → private <b>play + download</b> link\n"
+    "╰ 🧱 Bullet-proof downloads (multi-tunnel retry)\n"
+    "╰ 🔒 Links <b>self-destruct</b> in 10 min\n"
+    "╰ 🌐 <b>1000+</b> sites — YouTube, TikTok, IG, FB, X, Reddit, Vimeo…\n\n"
+    "━━━━━━━━━━━━━━━\n"
+    "👇 <b>Send a link to begin</b>"
+)
+
+
 def handle_start(chat_id, name):
-    text = (
-        f"👋 <b>Hello {esc(name)}!</b> ✨\n"
-        "━━━━━━━━━━━━━━━\n"
-        "I'm <b>ReClip</b> — your personal downloader 🎬🎵\n\n"
-        "🔗 Paste <b>any video link</b> and I will–\n"
-        "• 📥 download it for you\n"
-        "• 🎚 let you choose the quality\n"
-        "• 🚀 send it right here in this chat\n\n"
-        "<i>Works with YouTube, TikTok, Instagram, Facebook, X,\n"
-        "Reddit, Vimeo and 1000+ more sites.</i>\n\n"
-        "💎 <b>Any size, full quality</b> — huge & 1-hour videos come as a\n"
-        "private play/download link (50 MB limit doesn't apply).",
-    )
-    send_message(chat_id, text, main_menu(chat_id))
+    send_message(chat_id, WELCOME.replace("{name}", esc(name)), main_menu(chat_id))
 
 
 def handle_help(chat_id, message_id=None):
     text = (
-        "📖 <b>How to use ReClip</b>\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "1️⃣  Send me one or more links 🔗\n"
-        "2️⃣  I show the video info + thumbnail\n"
-        "3️⃣  Pick a <b>quality</b> — or tap 🎵 <b>MP3</b>\n"
-        "4️⃣  Your file arrives in a few seconds 🚀\n\n"
-        "✨ <b>Nice to know</b>\n"
-        "• Up to <b>5 links</b> per message\n"
-        "• Big files (any size, 1-hour+) → get a private <b>play/download link</b> 💎\n"
-        "• Small files (under 50 MB) come straight into the chat\n"
-        "• Links <b>self-destruct</b> in 10 min and are wiped from the server\n"
-        "• Tap ❌ <b>Cancel</b> anytime"
+        "╔══════════════════════╗\n"
+        "     📖  <b>H O W  T O  U S E</b>\n"
+        "╚══════════════════════╝\n\n"
+        "<b>①  Send a link</b> 🔗\n"
+        "<i>Any video/audio URL — up to 5 at once.</i>\n\n"
+        "<b>②  Pick quality</b> 💠\n"
+        "<i>Choose a resolution, or tap 🎵 MP3 for audio.</i>\n\n"
+        "<b>③  Get your file</b> 🚀\n"
+        "<i>Small files land in chat. Big ones → private link.</i>\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "🎁 <b>Good to know</b>\n"
+        "╰ ▸ Up to <b>5 links</b> per message\n"
+        "╰ ▸ 1-hour &amp; 4K → full-quality <b>play/download link</b> 💎\n"
+        "╰ ▸ Under 50 MB → delivered <b>right here</b> in chat\n"
+        "╰ ▸ Links <b>self-destruct</b> in 10 min, file wiped 🧹\n"
+        "╰ ▸ Tap ❌ <b>Cancel</b> anytime"
     )
     markup = {"inline_keyboard": [[{"text": "⬅️ Back", "callback_data": "back"}]]}
     if message_id:
@@ -1096,17 +1174,21 @@ def handle_help(chat_id, message_id=None):
 
 def handle_about(chat_id, message_id=None):
     text = (
-        "ℹ️ <b>About ReClip</b>\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "A fast, always-on downloader powered by <b>yt-dlp</b> + <b>ffmpeg</b>.\n"
+        "╔══════════════════════╗\n"
+        "     💎  <b>A B O U T</b>\n"
+        "╚══════════════════════╝\n\n"
+        "<b>ReClip</b> — a premium, always-on downloader.\n"
+        "Powered by <b>yt-dlp</b> + <b>ffmpeg</b>.\n"
         "Supports <b>1000+</b> sites for video and audio.\n\n"
-        "💎 <b>Full quality, any size</b>\n"
-        "• Small files arrive in chat (< 50 MB)\n"
-        "• Heavy / long videos get a private play+download link\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "💎 <b>Full quality · any size</b>\n"
+        "╰ ▸ Under 50 MB → straight into chat\n"
+        "╰ ▸ Heavy / 4K / 1-hour → private <b>play + download</b> link\n"
+        "╰ ▸ Multi-tunnel retry — it does not give up\n\n"
         "🔒 <b>Privacy first</b>\n"
-        "• Links are single-use, unlisted and self-destruct in 10 min\n"
-        "• Files are securely wiped from the server after expiry\n"
-        "• Nothing is stored permanently\n\n"
+        "╰ ▸ Links are unlisted &amp; single-file\n"
+        "╰ ▸ Self-destruct in 10 min, file securely wiped\n"
+        "╰ ▸ Nothing is stored permanently\n\n"
         "<i>Please respect copyright — only download content you have the right to.</i>"
     )
     markup = {"inline_keyboard": [[{"text": "⬅️ Back", "callback_data": "back"}]]}
@@ -1117,10 +1199,20 @@ def handle_about(chat_id, message_id=None):
 
 
 def handle_status(chat_id, message_id=None):
+    warp = PROXY_STATE.get("ip") or "direct"
+    tun = "🟢 online" if TUNNEL_STATE.get("up") else "🟡 standby"
     text = (
-        "📊 <b>Uptime</b>\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        f"🟢 <b>{fmt_dur(time.time() - START)}</b>"
+        "╔══════════════════════╗\n"
+        "     📊  <b>L I V E  S T A T U S</b>\n"
+        "╚══════════════════════╝\n\n"
+        "🟢 <b>Online</b> — everything healthy\n\n"
+        "⏱ <b>Uptime</b>\n"
+        "╰ " + fmt_dur(time.time() - START) + "\n\n"
+        "📡 <b>Full-quality relay</b>\n"
+        "╰ " + tun + "\n\n"
+        "🛰 <b>YouTube egress</b>\n"
+        "╰ <code>" + esc(warp) + "</code>\n\n"
+        "<i>Send a link anytime — I'm ready.</i>"
     )
     markup = {"inline_keyboard": [[{"text": "⬅️ Back", "callback_data": "back"}]]}
     if message_id:
@@ -1143,38 +1235,62 @@ def animate(chat_id, mid, stop, frames, label):
             break
 
 
+def _is_youtube(url):
+    return any(d in url for d in ("youtube.com", "youtu.be", "youtube-nocookie.com"))
+
+
 def fetch_and_prompt(chat_id, url):
     try:
-        msg = send_message(chat_id, "🔍 <b>Fetching video info…</b>")
+        msg = send_message(chat_id,
+                           "🔍 <b>Analyzing your link…</b>\n"
+                           "▱▱▱▱▱▱▱▱▱▱▱▱\n"
+                           "<i>Please hold on a moment…</i>")
         mid = (msg.get("result") or {}).get("message_id")
         stop = threading.Event()
         if mid:
             threading.Thread(target=animate, args=(chat_id, mid, stop,
-                             ["🔍", "🧩", "⚙️", "🧠", "🛰"], "Fetching video info…"),
+                             ["🔍", "🧩", "⚙️", "🧠", "🛰"], "\n<i>Analyzing your link…</i>"),
                              daemon=True).start()
+        # YouTube on a datacenter IP needs a clean egress -> guarantee WARP first
+        if WARP_ENABLED and _is_youtube(url) and not PROXY_STATE.get("up"):
+            try:
+                ensure_warp()
+            except Exception as exc:
+                log("fetch: warp ensure failed", exc)
         info, err = yt_info(url)
         stop.set()
         if not info:
             edit_message(chat_id, mid,
-                         "❌ <b>Couldn't read that link.</b>\n"
-                         "The site may be blocked, private or unsupported.\n\n"
-                         "<code>" + esc(url[:180]) + "</code>",
-                         {"inline_keyboard": [[{"text": "🔁 Try another", "callback_data": "back"}]]})
+                         "⚠️ <b>That link couldn't be read.</b>\n"
+                         "━━━━━━━━━━━━━━━\n"
+                         "Possible reasons:\n"
+                         "• The video is <b>private / members-only</b>\n"
+                         "• The site is <b>region-blocked</b>\n"
+                         "• The link is <b>not supported</b>\n\n"
+                         "<code>" + esc(url[:180]) + "</code>\n\n"
+                         "<i>Try another link — I retried many strategies already.</i>",
+                         {"inline_keyboard": [[{"text": "🔄 Try another link", "callback_data": "back"}]]})
             return
         title = info.get("title") or "Untitled"
         dur = fmt_dur(info.get("duration"))
         uploader = info.get("uploader") or info.get("channel") or info.get("uploader_id") or ""
         jid = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
         JOBS[jid] = {"chat_id": chat_id, "url": url, "info": info, "msg_id": mid}
+        opts = quality_options(info)[:8]
         rows = []
-        for h, label in quality_options(info)[:8]:
+        for h, label in opts:
             rows.append([{"text": f"🎬 {label}", "callback_data": f"v:{jid}:{h}"}])
         rows.append([{"text": "🎵 MP3 (Audio)", "callback_data": f"a:{jid}"}])
         rows.append([{"text": "❌ Cancel", "callback_data": f"x:{jid}"}])
-        cap = f"🎞 <b>{esc(title)[:200]}</b>\n"
+        best = opts[0][1] if opts else "best"
+        cap = ("🎞 <b>" + esc(title)[:200] + "</b>\n"
+               "━━━━━━━━━━━━━━━\n")
         if uploader:
-            cap += f"👤 {esc(uploader)[:80]}\n"
-        cap += f"⏱ {dur}\n\n✨ <b>Choose a format below</b> 👇"
+            cap += "👤 " + esc(uploader)[:80] + "\n"
+        cap += "⏱ " + dur + "\n"
+        cap += "💠 Best available: <b>" + esc(best) + "</b>\n\n"
+        cap += "✨ <b>Choose your format</b> 👇\n"
+        cap += "<i>Heavy files come as a full-quality play/download link.</i>"
         markup = {"inline_keyboard": rows}
         thumb = info.get("thumbnail")
         if thumb:
@@ -1188,6 +1304,8 @@ def fetch_and_prompt(chat_id, url):
                     if res.get("ok"):
                         if mid:
                             api("deleteMessage", {"chat_id": chat_id, "message_id": mid})
+                        # repoint the job at the photo message so taps always work
+                        JOBS[jid]["msg_id"] = None
                         return
             except Exception:
                 pass
@@ -1238,10 +1356,14 @@ def deliver(chat_id, jid, mode, height=None, cb_id=None):
     if cb_id:
         answer_cb(cb_id, "🚀 Download started…")
     cancel_btn = {"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": f"x:{jid}"}]]}
-    if mid:
-        edit_message(chat_id, mid,
-                     f"🚀 <b>Starting download…</b>\n🎞 {esc(title)[:120]}\n\n▱▱▱▱▱▱▱▱▱▱▱▱  0%",
-                     cancel_btn)
+    # always post a fresh, LIVE status message so a tap always shows feedback
+    st = send_message(chat_id,
+                      f"🚀 <b>Starting download…</b>\n🎞 {esc(title)[:120]}\n\n▱▱▱▱▱▱▱▱▱▱▱▱  0%",
+                      cancel_btn)
+    live_mid = (st.get("result") or {}).get("message_id")
+    if live_mid:
+        mid = live_mid
+        job["msg_id"] = mid
     chat_action(chat_id, "upload_video" if kind == "video" else "upload_voice")
 
     counter = {"n": 0}
@@ -1404,8 +1526,10 @@ def handle_update(upd):
                                  daemon=True).start()
             return
         if text:
-            send_message(chat_id, "🔗 <b>Send me a video link</b> and I'll download it for you! 🎬",
-                         main_menu())
+            send_message(chat_id,
+                         "🔗 <b>Send me a link</b> and I'll grab it for you! 🎬\n"
+                         "<i>Works with 1000+ sites — any size, full quality.</i>",
+                         main_menu(chat_id))
         return
 
     if "callback_query" in upd:
