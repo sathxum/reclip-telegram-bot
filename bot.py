@@ -20,6 +20,11 @@ import subprocess
 import sys
 import tarfile
 import threading
+import shutil
+import base64
+import secrets
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 from datetime import datetime
 
 import requests
@@ -31,6 +36,7 @@ WORKFLOW_FILE = os.environ.get("WORKFLOW_FILE", "bot.yml")
 RUNTIME_MINUTES = int(os.environ.get("RUNTIME_MINUTES", "340"))
 FILE_TTL = int(os.environ.get("FILE_TTL_MIN", "20")) * 60
 MAX_PAR = int(os.environ.get("MAX_PARALLEL_JOBS", "3"))
+MAX_PARTS = int(os.environ.get("MAX_PARTS", "15"))
 
 if not BOT_TOKEN:
     print("FATAL: BOT_TOKEN is not set")
@@ -406,6 +412,415 @@ def warp_watchdog():
             stall = 0
 
 
+# ------------------------------------------------------------- tunnel ------
+TUNNEL_ENABLED = os.environ.get('TUNNEL_ENABLE', '1').strip().lower() not in ('0', 'false', 'no')
+TUNNEL_TTL = int(os.environ.get('TUNNEL_TTL_MIN', '10')) * 60
+TUNNEL_PORT = int(os.environ.get('TUNNEL_PORT', '8791'))
+CLOUDFLARED_URL = ('https://github.com/cloudflare/cloudflared/releases/latest/download/'
+                   'cloudflared-linux-amd64')
+TUNNEL_DIR = '/tmp/reclip_tunnel'
+TUNNEL_STATE = {'proc': None, 'url': '', 'up': False}
+_TUNNEL_LOCK = threading.Lock()
+_SHARES = {}
+_SHARES_LOCK = threading.Lock()
+
+INDEX_PAGE = ('<!doctype html><html><head><meta charset="utf-8">'
+              '<meta name="robots" content="noindex,nofollow">'
+              '<title>ReClip</title></head><body style="background:#0f1117;color:#e6e6e6;'
+              'font-family:system-ui;text-align:center;padding:80px 20px">'
+              '<h2>This link is private.</h2>'
+              '<p>Ask the bot for a fresh link.</p></body></html>')
+
+
+def _share_html(token, title, kind, size):
+    import html as _html
+    safe_title = _html.escape(title or 'ReClip media')
+    if kind == 'audio':
+        media = ('<audio controls autoplay style="width:100%" src="/' + token +
+                 '/v"></audio>')
+    else:
+        media = ('<video controls autoplay playsinline style="width:100%;max-height:70vh;'
+                 'background:#000;border-radius:12px" src="/' + token + '/v"></video>')
+    return ('<!doctype html><html><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<meta name="robots" content="noindex,nofollow">'
+            '<title>' + safe_title + '</title></head>'
+            '<body style="margin:0;background:#0f1117;color:#e6e6e6;'
+            'font-family:system-ui;text-align:center">'
+            '<div style="max-width:900px;margin:0 auto;padding:24px 16px">'
+            '<h2 style="font-weight:600">' + safe_title + '</h2>'
+            '<p style="color:#9aa0a6">Full quality &middot; ' + fmt_size(size) +
+            ' &middot; expires in ' + str(max(1, TUNNEL_TTL // 60)) + ' min</p>' +
+            media +
+            '<p style="margin-top:18px"><a href="/' + token + '/v" download '
+            'style="display:inline-block;padding:12px 22px;background:#2a7fff;color:#fff;'
+            'border-radius:10px;text-decoration:none">Download</a></p>'
+            '</div></body></html>')
+
+
+class _ShareHandler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    server_version = 'r'
+    sys_version = ''
+
+    def log_message(self, *a):
+        return
+
+    def _head(self, code, ctype, length, extra=None):
+        self.send_response(code)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(length))
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Robots-Tag', 'noindex, nofollow')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('Server', 'r')
+        if extra:
+            for k, v in extra:
+                self.send_header(k, v)
+        self.end_headers()
+
+    def _body(self, code, body, ctype='text/plain; charset=utf-8'):
+        try:
+            self._head(code, ctype, len(body))
+            if self.command != 'HEAD':
+                self.wfile.write(body)
+        except Exception:
+            pass
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        try:
+            segs = [s for s in urlparse(self.path).path.split('/') if s]
+            if not segs:
+                self._body(200, INDEX_PAGE.encode(), 'text/html; charset=utf-8')
+                return
+            with _SHARES_LOCK:
+                share = dict(_SHARES.get(segs[0]) or {})
+            if not share:
+                self._body(404, b'Not found')
+                return
+            if time.time() > share['expires']:
+                self._body(410, b'Link expired')
+                return
+            if len(segs) == 1:
+                fp = share['path']
+                size = os.path.getsize(fp) if os.path.isfile(fp) else 0
+                html = _share_html(segs[0], share.get('title'), share.get('kind'), size)
+                self._body(200, html.encode(), 'text/html; charset=utf-8')
+                return
+            if len(segs) == 2 and segs[1] == 'v':
+                self._serve(share)
+                return
+            self._body(404, b'Not found')
+        except Exception:
+            pass
+
+    def _serve(self, share):
+        fp = share['path']
+        if not os.path.isfile(fp):
+            self._body(404, b'Gone')
+            return
+        total = os.path.getsize(fp)
+        start, end = 0, total - 1
+        code = 200
+        rng = self.headers.get('Range')
+        if rng:
+            m = re.match(r'bytes=(\d*)-(\d*)', rng or '')
+            if m:
+                if m.group(1):
+                    start = int(m.group(1))
+                if m.group(2):
+                    end = min(int(m.group(2)), total - 1)
+                if start >= total or start > end:
+                    self._body(416, b'Range not satisfiable')
+                    return
+                code = 206
+        length = end - start + 1
+        extra = [('Accept-Ranges', 'bytes'),
+                 ('Content-Disposition', 'inline; filename="media.bin"')]
+        if code == 206:
+            extra.append(('Content-Range', 'bytes %d-%d/%d' % (start, end, total)))
+        try:
+            self._head(code, share.get('ctype') or 'application/octet-stream', length, extra)
+            if self.command == 'HEAD':
+                return
+            with open(fp, 'rb') as fh:
+                fh.seek(start)
+                left = length
+                while left > 0:
+                    chunk = fh.read(min(262144, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except Exception:
+            pass
+
+
+def _serve_http():
+    try:
+        httpd = ThreadingHTTPServer(('127.0.0.1', TUNNEL_PORT), _ShareHandler)
+        httpd.daemon_threads = True
+        log('tunnel: http server on', TUNNEL_PORT)
+        httpd.serve_forever()
+    except Exception as exc:
+        log('tunnel: http server err', exc)
+
+
+def _ensure_cloudflared():
+    os.makedirs(WARP_DIR, exist_ok=True)
+    cf = os.path.join(WARP_DIR, 'cloudflared')
+    if os.path.isfile(cf) and os.path.getsize(cf) > 1000000:
+        return cf
+    if not _download(CLOUDFLARED_URL, cf):
+        return None
+    try:
+        os.chmod(cf, 0o755)
+    except Exception:
+        pass
+    return cf
+
+
+def _kill_tunnel():
+    p = TUNNEL_STATE.get('proc')
+    if p and p.poll() is None:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
+def setup_tunnel():
+    with _TUNNEL_LOCK:
+        if not TUNNEL_ENABLED:
+            return False
+        if TUNNEL_STATE.get('up') and TUNNEL_STATE.get('url'):
+            return True
+        cf = _ensure_cloudflared()
+        if not cf:
+            log('tunnel: cloudflared unavailable')
+            return False
+        os.makedirs(TUNNEL_DIR, exist_ok=True)
+        logf = os.path.join(TUNNEL_DIR, 'cloudflared.log')
+        try:
+            open(logf, 'w').close()
+            out = open(logf, 'ab')
+            proc = subprocess.Popen([cf, 'tunnel', '--url',
+                                     'http://127.0.0.1:' + str(TUNNEL_PORT),
+                                     '--no-autoupdate'], stdout=out,
+                                    stderr=subprocess.STDOUT)
+            TUNNEL_STATE['proc'] = proc
+        except Exception as exc:
+            log('tunnel: start err', exc)
+            return False
+        for _ in range(45):
+            time.sleep(2)
+            try:
+                txt = open(logf, errors='ignore').read()
+            except Exception:
+                txt = ''
+            m = re.findall(r'https://[a-z0-9-]+\.trycloudflare\.com', txt)
+            if m:
+                TUNNEL_STATE['url'] = m[-1]
+                TUNNEL_STATE['up'] = True
+                log('tunnel: up at', TUNNEL_STATE['url'])
+                return True
+        log('tunnel: failed to get url')
+        return False
+
+
+def tunnel_watchdog():
+    while time.time() < DEADLINE + 120:
+        time.sleep(60)
+        p = TUNNEL_STATE.get('proc')
+        if (TUNNEL_STATE.get('up') and TUNNEL_STATE.get('url')
+                and p and p.poll() is None):
+            continue
+        log('tunnel: down - restarting')
+        _kill_tunnel()
+        TUNNEL_STATE['up'] = False
+        TUNNEL_STATE['url'] = ''
+        setup_tunnel()
+
+
+def create_share(path, title, kind):
+    if not TUNNEL_STATE.get('url'):
+        setup_tunnel()
+    if not TUNNEL_STATE.get('url'):
+        return None
+    token = secrets.token_urlsafe(24).replace('-', '').replace('_', '')
+    ctype = 'audio/mpeg' if kind == 'audio' else 'video/mp4'
+    with _SHARES_LOCK:
+        _SHARES[token] = {'path': path, 'title': title, 'kind': kind,
+                          'ctype': ctype, 'expires': time.time() + TUNNEL_TTL}
+    _track(path)
+    stats_bump('tunnels')
+    return TUNNEL_STATE['url'].rstrip('/') + '/' + token
+
+
+def expiry_loop():
+    while time.time() < DEADLINE + 300:
+        time.sleep(20)
+        now = time.time()
+        dead = []
+        with _SHARES_LOCK:
+            for tok, sh in list(_SHARES.items()):
+                if now > sh['expires']:
+                    dead.append((tok, sh))
+                    _SHARES.pop(tok, None)
+        for tok, sh in dead:
+            _cleanup([sh.get('path')])
+            log('tunnel: share expired + wiped', tok)
+
+
+def _tunnel_msg(chat_id, mid, link, title, size, dur):
+    text = ('\u2705 <b>Ready — full quality!</b>\n'
+            '━━━━━━━━━━━━━━━\n'
+            '🎞 <b>' + esc(title)[:180] + '</b>\n'
+            '📦 ' + fmt_size(size) + ' • \u23f1 ' + fmt_dur(dur) + '\n\n'
+            '\u25b6\ufe0f <b>Play or download</b> (original quality, no compression):\n'
+            '<a href="' + link + '">' + link + '</a>\n\n'
+            '\u23f3 This link self-destructs in ' + str(TUNNEL_TTL // 60) + ' min.\n'
+            '\U0001f512 Private single-file link. Nothing else is exposed.')
+    markup = {'inline_keyboard': [[{'text': '\u25b6\ufe0f Play / Download', 'url': link}]]}
+    if mid:
+        edit_message(chat_id, mid, text, markup)
+    else:
+        send_message(chat_id, text, markup)
+
+
+# -------------------------------------------------------------- state ------
+STATE_BRANCH = 'reclip-state'
+STATS_LOCK = threading.Lock()
+STATS = {'boots': 0, 'downloads': 0, 'tunnels': 0, 'bytes': 0,
+         'admin_id': 0, 'admin_name': '', 'first_boot': '', 'last_boot': ''}
+try:
+    ADMIN_ID = int((os.environ.get('ADMIN_ID', '0') or '0').strip())
+except Exception:
+    ADMIN_ID = 0
+
+
+def _gh_headers():
+    return {'Authorization': 'Bearer ' + GH_PAT,
+            'Accept': 'application/vnd.github+json'}
+
+
+def stats_bump(key, n=1):
+    with STATS_LOCK:
+        STATS[key] = STATS.get(key, 0) + n
+
+
+def _ensure_state_branch():
+    if not (GH_PAT and GH_REPO):
+        return False
+    try:
+        r = requests.get('https://api.github.com/repos/' + GH_REPO +
+                         '/git/ref/heads/' + STATE_BRANCH,
+                         headers=_gh_headers(), timeout=20)
+        if r.status_code == 200:
+            return True
+        m = requests.get('https://api.github.com/repos/' + GH_REPO +
+                         '/git/ref/heads/main', headers=_gh_headers(), timeout=20)
+        if m.status_code != 200:
+            return False
+        sha = m.json()['object']['sha']
+        c = requests.post('https://api.github.com/repos/' + GH_REPO + '/git/refs',
+                          headers=_gh_headers(),
+                          json={'ref': 'refs/heads/' + STATE_BRANCH, 'sha': sha},
+                          timeout=20)
+        return c.status_code in (200, 201)
+    except Exception as exc:
+        log('state: branch err', exc)
+        return False
+
+
+def stats_load():
+    if not (GH_PAT and GH_REPO):
+        return
+    _ensure_state_branch()
+    try:
+        r = requests.get('https://api.github.com/repos/' + GH_REPO +
+                         '/contents/state.json?ref=' + STATE_BRANCH,
+                         headers=_gh_headers(), timeout=20)
+        if r.status_code == 200:
+            j = r.json()
+            STATS.update(json.loads(base64.b64decode(j['content']).decode()))
+            STATS['_sha'] = j.get('sha')
+            log('state: loaded | boots', STATS.get('boots'))
+    except Exception as exc:
+        log('state: load err', exc)
+
+
+def stats_save():
+    if not (GH_PAT and GH_REPO):
+        return
+    try:
+        with STATS_LOCK:
+            body = {k: v for k, v in STATS.items() if not k.startswith('_')}
+        content = base64.b64encode(json.dumps(body, indent=1).encode()).decode()
+        payload = {'message': 'state update', 'content': content, 'branch': STATE_BRANCH}
+        if STATS.get('_sha'):
+            payload['sha'] = STATS['_sha']
+        r = requests.put('https://api.github.com/repos/' + GH_REPO +
+                         '/contents/state.json', headers=_gh_headers(),
+                         json=payload, timeout=25)
+        if r.status_code in (200, 201):
+            STATS['_sha'] = r.json()['content']['sha']
+    except Exception as exc:
+        log('state: save err', exc)
+
+
+def stats_loop():
+    while time.time() < DEADLINE + 60:
+        time.sleep(180)
+        stats_save()
+
+
+def is_admin(uid):
+    if ADMIN_ID:
+        return uid == ADMIN_ID
+    return bool(STATS.get('admin_id')) and uid == STATS.get('admin_id')
+
+
+def set_admin_if_needed(uid, name):
+    if ADMIN_ID or STATS.get('admin_id'):
+        return
+    STATS['admin_id'] = uid
+    STATS['admin_name'] = name
+    log('admin: auto-detected', uid, name)
+    stats_save()
+
+
+def handle_admin(chat_id, message_id=None):
+    if not is_admin(chat_id):
+        send_message(chat_id, '⛔ <b>Admin only.</b>')
+        return
+    with _SHARES_LOCK:
+        shares = len(_SHARES)
+    text = ('\U0001f6e1 <b>Admin panel</b>\n'
+            '━━━━━━━━━━━━━━━\n'
+            '\U0001f7e2 Uptime (this run): <b>' + fmt_dur(time.time() - START) + '</b>\n'
+            '\U0001f680 Boots recorded: <b>' + str(STATS.get('boots', 0)) + '</b>\n'
+            '\u2b07\ufe0f Downloads served: <b>' + str(STATS.get('downloads', 0)) + '</b>\n'
+            '\U0001f4e1 Tunnel links created: <b>' + str(STATS.get('tunnels', 0)) + '</b>\n'
+            '🎞 Active links now: <b>' + str(shares) + '</b>\n'
+            '\U0001f310 Tunnel status: <b>' +
+            ('up' if TUNNEL_STATE.get('up') else 'down') + '</b>\n'
+            '\U0001f6f0 WARP egress: <b>' + (PROXY_STATE.get('ip') or 'direct') + '</b>\n'
+            '\U0001f464 Admin: <b>' + esc(STATS.get('admin_name') or 'unset') + '</b>\n'
+            '\U0001f9f9 Auto-wipe window: <b>' + str(TUNNEL_TTL // 60) + ' min</b>')
+    markup = {'inline_keyboard': [[{'text': '⬅️ Back', 'callback_data': 'back'}]]}
+    if message_id:
+        edit_message(chat_id, message_id, text, markup)
+    else:
+        send_message(chat_id, text, main_menu())
+
+
 # ---------------------------------------------------------------- engine ----
 
 
@@ -629,12 +1044,15 @@ def send_media(chat_id, path, kind, caption):
 
 # -------------------------------------------------------------------- UI ----
 
-def main_menu():
-    return {"inline_keyboard": [
+def main_menu(chat_id=None):
+    rows = [
         [{"text": "🎞 How to use", "callback_data": "help"},
          {"text": "ℹ️ About", "callback_data": "about"}],
         [{"text": "📊 Status", "callback_data": "status"}],
-    ]}
+    ]
+    if chat_id is not None and is_admin(chat_id):
+        rows.append([{"text": "🛡 Admin", "callback_data": "admin"}])
+    return {"inline_keyboard": rows}
 
 
 def handle_start(chat_id, name):
@@ -647,9 +1065,11 @@ def handle_start(chat_id, name):
         "• 🎚 let you choose the quality\n"
         "• 🚀 send it right here in this chat\n\n"
         "<i>Works with YouTube, TikTok, Instagram, Facebook, X,\n"
-        "Reddit, Vimeo and 1000+ more sites.</i>"
+        "Reddit, Vimeo and 1000+ more sites.</i>\n\n"
+        "💎 <b>Any size, full quality</b> — huge & 1-hour videos come as a\n"
+        "private play/download link (50 MB limit doesn't apply).",
     )
-    send_message(chat_id, text, main_menu())
+    send_message(chat_id, text, main_menu(chat_id))
 
 
 def handle_help(chat_id, message_id=None):
@@ -662,15 +1082,16 @@ def handle_help(chat_id, message_id=None):
         "4️⃣  Your file arrives in a few seconds 🚀\n\n"
         "✨ <b>Nice to know</b>\n"
         "• Up to <b>5 links</b> per message\n"
-        "• Long videos are auto-shrunk or split into parts\n"
-        "• Tap ❌ <b>Cancel</b> anytime\n"
-        "• 🔒 Downloaded files are <b>auto-deleted</b>, nothing is kept"
+        "• Big files (any size, 1-hour+) → get a private <b>play/download link</b> 💎\n"
+        "• Small files (under 50 MB) come straight into the chat\n"
+        "• Links <b>self-destruct</b> in 10 min and are wiped from the server\n"
+        "• Tap ❌ <b>Cancel</b> anytime"
     )
     markup = {"inline_keyboard": [[{"text": "⬅️ Back", "callback_data": "back"}]]}
     if message_id:
         edit_message(chat_id, message_id, text, markup)
     else:
-        send_message(chat_id, text, main_menu())
+        send_message(chat_id, text, main_menu(chat_id))
 
 
 def handle_about(chat_id, message_id=None):
@@ -679,8 +1100,12 @@ def handle_about(chat_id, message_id=None):
         "━━━━━━━━━━━━━━━\n\n"
         "A fast, always-on downloader powered by <b>yt-dlp</b> + <b>ffmpeg</b>.\n"
         "Supports <b>1000+</b> sites for video and audio.\n\n"
+        "💎 <b>Full quality, any size</b>\n"
+        "• Small files arrive in chat (< 50 MB)\n"
+        "• Heavy / long videos get a private play+download link\n\n"
         "🔒 <b>Privacy first</b>\n"
-        "• Downloaded files are auto-deleted\n"
+        "• Links are single-use, unlisted and self-destruct in 10 min\n"
+        "• Files are securely wiped from the server after expiry\n"
         "• Nothing is stored permanently\n\n"
         "<i>Please respect copyright — only download content you have the right to.</i>"
     )
@@ -688,7 +1113,7 @@ def handle_about(chat_id, message_id=None):
     if message_id:
         edit_message(chat_id, message_id, text, markup)
     else:
-        send_message(chat_id, text, main_menu())
+        send_message(chat_id, text, main_menu(chat_id))
 
 
 def handle_status(chat_id, message_id=None):
@@ -701,7 +1126,7 @@ def handle_status(chat_id, message_id=None):
     if message_id:
         edit_message(chat_id, message_id, text, markup)
     else:
-        send_message(chat_id, text, main_menu())
+        send_message(chat_id, text, main_menu(chat_id))
 
 
 # ---------------------------------------------------------------- fetching --
@@ -802,7 +1227,7 @@ def deliver(chat_id, jid, mode, height=None, cb_id=None):
 
     if mode == "audio":
         opts = ["-f", "bestaudio/best", "-x", "--audio-format", "mp3",
-                "--audio-quality", "96K"]
+                "--audio-quality", "128K"]
         kind = "audio"
     else:
         sel = (f"bestvideo[height<={height}]+bestaudio/best[height<={height}]/best"
@@ -839,74 +1264,92 @@ def deliver(chat_id, jid, mode, height=None, cb_id=None):
 
     _track(path)
     size = os.path.getsize(path)
-    parts = [path]
+    stats_bump("downloads")
+    stats_bump("bytes", size)
 
-    if size > TG_LIMIT:
-        if kind == "video":
-            if mid:
-                edit_message(chat_id, mid,
-                             f"🛠 <b>File is {fmt_size(size)}.</b>\n"
-                             "Optimising it to fit Telegram (50&nbsp;MB)… ⏳",
-                             cancel_btn)
-            stop = threading.Event()
-            if mid:
-                threading.Thread(target=animate, args=(chat_id, mid, stop,
-                                 ["🛠", "🎛", "📦", "⏳"], "Optimising…"),
-                                 daemon=True).start()
-            parts = fit_video(path, dur, title)
-            stop.set()
-            for p in parts:
-                _track(p)
-        else:
-            parts = []
-
-    if not parts:
+    # small enough -> deliver straight into the chat
+    if size <= TG_LIMIT:
         if mid:
             edit_message(chat_id, mid,
-                         "⚠️ <b>File is too large for Telegram's 50 MB bot limit.</b>\n"
-                         "Try a lower quality or MP3 🎵",
-                         {"inline_keyboard": [[{"text": "🎵 Get MP3", "callback_data": f"a:{jid}"}]]})
+                         f"⬆️ <b>Uploading {fmt_size(size)}…</b>\n🎞 {esc(title)[:120]}", None)
+        cap = f"🎞 <b>{esc(title)[:180]}</b>\n⏱ {fmt_dur(dur)} • {fmt_size(size)}"
+        chat_action(chat_id, "upload_video" if kind == "video" else "upload_voice")
+        ok, _ = send_media(chat_id, path, kind, cap)
+        if ok:
+            if mid:
+                try:
+                    api("deleteMessage", {"chat_id": chat_id, "message_id": mid})
+                except Exception:
+                    pass
+        elif mid:
+            edit_message(chat_id, mid, "❌ <b>Upload failed</b> — please try again.", None)
         _cleanup([path])
         return
 
-    total = len(parts)
-    sent = 0
-    for idx, p in enumerate(parts, 1):
-        try:
-            psize = os.path.getsize(p)
-        except OSError:
-            break
-        if psize > TG_LIMIT:
-            continue
+    # too big for Telegram -> serve FULL quality through the Cloudflare tunnel
+    link = create_share(path, title, kind)
+    if link:
+        _tunnel_msg(chat_id, mid, link, title, size, dur)
+        return
+
+    # tunnel unavailable -> last-resort compress to fit Telegram
+    if kind == "video":
         if mid:
-            head = f"({idx}/{total}) " if total > 1 else ""
             edit_message(chat_id, mid,
-                         f"⬆️ <b>Uploading {head}{fmt_size(psize)}…</b>\n🎞 {esc(title)[:120]}", None)
-        cap = f"🎞 <b>{esc(title)[:180]}</b>\n⏱ {fmt_dur(dur)} • {fmt_size(psize)}"
-        if total > 1:
-            cap += f"\n📦 Part <b>{idx}</b> of <b>{total}</b>"
-        chat_action(chat_id, "upload_video" if kind == "video" else "upload_voice")
-        ok, _ = send_media(chat_id, p, kind, cap)
-        if ok:
-            sent += 1
-        else:
-            log("upload failed", p, fmt_size(psize))
-        time.sleep(1.5)
-
-    if total > 1 and "_p" in parts[0] or (total > 1 and "_q" in parts[0]):
-        # split parts keep the original too; nothing extra to announce
-        pass
-
-    if sent:
+                         f"🛠 <b>File is {fmt_size(size)}.</b>\n"
+                         "Optimising it to fit Telegram (50 MB)… ⏳",
+                         cancel_btn)
+        stop = threading.Event()
         if mid:
+            threading.Thread(target=animate, args=(chat_id, mid, stop,
+                             ["🛠", "🎛", "📦", "⏳"], "Optimising…"),
+                             daemon=True).start()
+        parts = fit_video(path, dur, title)
+        stop.set()
+        for p in parts:
+            _track(p)
+        if not parts:
+            if mid:
+                edit_message(chat_id, mid,
+                             "❌ <b>Could not deliver this file.</b>\nTry a lower quality.",
+                             None)
+            _cleanup([path])
+            return
+        total = len(parts)
+        sent = 0
+        for idx, p in enumerate(parts, 1):
+            try:
+                psize = os.path.getsize(p)
+            except OSError:
+                break
+            if psize > TG_LIMIT:
+                continue
+            head = f"({idx}/{total}) " if total > 1 else ""
+            if mid:
+                edit_message(chat_id, mid,
+                             f"⬆️ <b>Uploading {head}{fmt_size(psize)}…</b>\n🎞 {esc(title)[:120]}", None)
+            cap = f"🎞 <b>{esc(title)[:180]}</b>\n⏱ {fmt_dur(dur)} • {fmt_size(psize)}"
+            if total > 1:
+                cap += f"\n📦 Part <b>{idx}</b> of <b>{total}</b>"
+            chat_action(chat_id, "upload_video")
+            ok, _ = send_media(chat_id, p, "video", cap)
+            if ok:
+                sent += 1
+            time.sleep(1.5)
+        if sent and mid:
             try:
                 api("deleteMessage", {"chat_id": chat_id, "message_id": mid})
             except Exception:
                 pass
-    else:
-        if mid:
-            edit_message(chat_id, mid, "❌ <b>Upload failed</b> — please try again.", None)
-    _cleanup(parts + [path])
+        _cleanup(parts + [path])
+        return
+
+    if mid:
+        edit_message(chat_id, mid,
+                     "⚠️ <b>File is too large for Telegram's 50 MB bot limit.</b>\n"
+                     "Try a lower quality or MP3 🎵",
+                     {"inline_keyboard": [[{"text": "🎵 Get MP3", "callback_data": f"a:{jid}"}]]})
+    _cleanup([path])
 
 
 def _cleanup(paths):
@@ -929,6 +1372,7 @@ def handle_update(upd):
         if chat_id is None:
             return
         name = chat.get("first_name") or chat.get("title") or "there"
+        set_admin_if_needed(chat_id, name)
         text = m.get("text") or m.get("caption") or ""
         if text.startswith("/start"):
             handle_start(chat_id, name)
@@ -941,6 +1385,9 @@ def handle_update(upd):
             return
         if text.startswith("/status"):
             handle_status(chat_id)
+            return
+        if text.startswith("/admin"):
+            handle_admin(chat_id)
             return
         urls = [u.rstrip(".,);]") for u in URL_RE.findall(text)]
         if urls:
@@ -977,9 +1424,12 @@ def handle_update(upd):
         elif data == "status":
             answer_cb(cb_id)
             handle_status(chat_id, mid)
+        elif data == "admin":
+            answer_cb(cb_id)
+            handle_admin(chat_id, mid)
         elif data == "back":
             answer_cb(cb_id)
-            edit_message(chat_id, mid, "👋 <b>Send me a link to get started!</b> 🔗", main_menu())
+            edit_message(chat_id, mid, "👋 <b>Send me a link to get started!</b> 🔗", main_menu(chat_id))
         elif data.startswith("v:"):
             parts = data.split(":")
             height = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() and int(parts[2]) > 0 else None
@@ -1059,8 +1509,20 @@ def rerun_scheduler():
 def main():
     log("bot starting | runtime", RUNTIME_MINUTES, "min | warp:", WARP_ENABLED,
         "| parallel:", MAX_PAR)
+    stats_load()
+    stats_bump("boots")
+    if not STATS.get("first_boot"):
+        STATS["first_boot"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    STATS["last_boot"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    stats_save()
     threading.Thread(target=janitor_loop, daemon=True).start()
+    threading.Thread(target=expiry_loop, daemon=True).start()
+    threading.Thread(target=stats_loop, daemon=True).start()
     threading.Thread(target=rerun_scheduler, daemon=True).start()
+    threading.Thread(target=_serve_http, daemon=True).start()
+    threading.Thread(target=setup_tunnel, daemon=True).start()
+    if TUNNEL_ENABLED:
+        threading.Thread(target=tunnel_watchdog, daemon=True).start()
     ok = setup_warp()
     if WARP_ENABLED:
         threading.Thread(target=warp_watchdog, daemon=True).start()
@@ -1089,6 +1551,8 @@ def main():
             log("loop exc", exc)
             time.sleep(3)
     log("runtime budget reached, exiting")
+    stats_save()
+    _kill_tunnel()
     _kill_proxy()
     if not _DISPATCH["ok"]:
         trigger_rerun()

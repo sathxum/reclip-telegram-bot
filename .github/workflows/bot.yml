@@ -54,6 +54,8 @@ jobs:
           FILE_TTL_MIN: '20'
           MAX_PARALLEL_JOBS: '3'
           WARP_ENABLE: '1'
+          TUNNEL_ENABLE: '1'
+          TUNNEL_TTL_MIN: '10'
           WGCF_PROFILE: ${{ secrets.WGCF_PROFILE }}
         run: |
           python bot.py

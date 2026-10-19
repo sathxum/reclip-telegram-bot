@@ -44,7 +44,7 @@ Expected scopes include `repo` and `workflow`.
 
 ```
 .
-├── bot.py                      # the whole bot (WARP + UI + download engine + janitor)
+├── bot.py                      # the whole bot (WARP + quick tunnel + UI + engine + admin)
 ├── requirements.txt            # requests, yt-dlp
 ├── README.md                   # human setup guide
 ├── AGENT.md                    # this file
@@ -57,8 +57,10 @@ Expected scopes include `repo` and `workflow`.
 |---|---|---|
 | Telegram API helpers | top | `api()`, `send_message`, `edit_message`, callbacks |
 | WARP relay | mid | `setup_warp`, `warp_watchdog`, `_write_wp_conf`, `_register_profile` |
-| Download engine | mid | `base_cmd`, `yt_info`, `run_download`, `compress_to_fit`, `send_media` |
-| UI | mid | `handle_start/help/about/status`, `main_menu` |
+| Quick tunnel + web server | mid | `setup_tunnel`, `tunnel_watchdog`, `_ShareHandler`, `create_share`, `expiry_loop`, `_tunnel_msg` |
+| Stats + admin | mid | `stats_load/save`, `stats_bump`, `set_admin_if_needed`, `is_admin`, `handle_admin` |
+| Download engine | mid | `yt_base`, `yt_info`, `run_download`, `fit_video`, `_split`, `send_media` |
+| UI | mid | `handle_start/help/about/status/admin`, `main_menu` |
 | Fetch + deliver | mid | `fetch_and_prompt`, `deliver` |
 | Update loop | bottom | `handle_update`, `janitor_loop`, `main`, `trigger_rerun` |
 
@@ -155,10 +157,15 @@ Success = run `in_progress` with step **"Run bot"** running, and `getMe` returns
 | `GH_REPO` | — | set by workflow from `github.repository` |
 | `WORKFLOW_FILE` | `bot.yml` | workflow to dispatch |
 | `RUNTIME_MINUTES` | `340` | worker lifetime |
-| `FILE_TTL_MIN` | `10` | downloaded-file auto-delete window |
+| `FILE_TTL_MIN` | `20` | downloaded-file auto-delete window (janitor) |
+| `MAX_PARALLEL_JOBS` | `3` | concurrent download workers |
 | `WARP_ENABLE` | `1` | bring up Cloudflare WARP relay (fixes YouTube) |
 | `WARP_PROXY_PORT` | `25344` | local SOCKS5 port for the WARP relay |
 | `WGCF_PROFILE` | — | optional pre-made WARP WireGuard profile |
+| `TUNNEL_ENABLE` | `1` | bring up the Cloudflare quick tunnel for big files |
+| `TUNNEL_TTL_MIN` | `10` | how long a full-quality link lives before auto-wipe |
+| `TUNNEL_PORT` | `8791` | local port the private share server binds (127.0.0.1) |
+| `ADMIN_ID` | — | fixed admin Telegram user id (optional; else auto-detected) |
 
 ---
 
@@ -170,6 +177,24 @@ Success = run `in_progress` with step **"Run bot"** running, and `getMe` returns
 - **WARP fallback chain.** On failure the bot tries 9 WARP endpoints, then re-registers a
   fresh account and retries. If WARP is entirely unavailable it falls back to alternate
   player clients and direct connections. A watchdog re-checks every 45 s.
+- **Full-quality delivery via Cloudflare quick tunnel.** Files under 50 MB are sent straight
+  into the chat. Anything larger (long/1-hour videos, 4K, big MP3s) is served over a
+  `*.trycloudflare.com` quick tunnel as a private play+download page — no compression, original
+  quality, any size. `deliver()` only falls back to `fit_video`/`_split` compression if the
+  tunnel is down.
+- **The share server is locked down.** It binds `127.0.0.1` (only reachable through the tunnel),
+  serves a single unlisted random URL per file, and all other paths return a generic private
+  notice or 404. Response headers forbid indexing/caching; there is **no directory listing, no
+  file browser, and no shell** — only an inline `<video>`/`<audio>` element plus a Download
+  button. Do not expose anything else on it.
+- **Links self-destruct (10 min).** `expiry_loop()` removes the share entry and securely wipes
+  the file from disk after `TUNNEL_TTL_MIN`; the janitor does the same for leftovers. Nothing
+  survives the run.
+- **Admin auto-detection.** The first Telegram user to interact is recorded as admin and shown a
+  `🛡 Admin` button + `/admin` panel (uptime, boots, downloads, tunnels created, active links,
+  WARP egress, wipe window). Set a fixed `ADMIN_ID` env to lock this down.
+- **Stats persist across fresh VMs** via a `reclip-state` git branch (`state.json`). Tiny text
+  only; loaded on boot, saved every 3 min and at exit.
 - **Only one worker may run at once** — Telegram allows a single `getUpdates` consumer.
   The workflow uses a `concurrency` group to enforce this.
 - **Files are ephemeral by design.** A janitor thread wipes downloads after `FILE_TTL_MIN`;
@@ -190,4 +215,8 @@ Success = run `in_progress` with step **"Run bot"** running, and `getMe` returns
 | Change quality list | `quality_options()` |
 | Change file lifetime | workflow `env:` or `FILE_TTL_MIN` in `bot.py` |
 | Change run length | `RUNTIME_MINUTES` + workflow `timeout-minutes` |
+| Change link expiry | `TUNNEL_TTL_MIN` (workflow `env:`) |
+| Change who is admin | set `ADMIN_ID` env, or delete `state.json` on `reclip-state` and re-seed |
+| Change big-file page look | `_share_html()` |
+| Change admin panel text | `handle_admin()` |
 | Add a new command | `handle_update()` message branch + a `handle_*` function |

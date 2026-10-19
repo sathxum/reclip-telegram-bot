@@ -12,7 +12,12 @@ Runs **free on GitHub Actions** — no server needed, auto-restarts to stay onli
 - Thumbnail preview with inline buttons
 - Animated progress bar while downloading
 - Bulk links (up to 5 per message)
-- Auto-compress to fit Telegram's 50 MB bot limit
+- 💎 **Full quality, any size** — heavy / 1-hour videos are served over a private
+  Cloudflare quick-tunnel page you can **play or download** (no 50 MB compression)
+- 🔒 Links are unlisted, single-file and **self-destruct after 10 min** (file wiped from disk)
+- 🛡 Auto-detected **admin panel** (uptime, boots, downloads, tunnels, WARP egress)
+- 📊 Stats persist across fresh VMs via a tiny `reclip-state` branch
+- Auto-compress to fit Telegram's 50 MB bot limit (fallback if the tunnel is down)
 - 🌐 **Cloudflare WARP relay** — fixes YouTube's datacenter IP block with **no cookies**
 - 🧱 **Multi-layer fallback** — 9 WARP endpoints, account re-registration, player-client rotations
 - 🔒 **Auto-delete** — downloaded files are wiped after 20 min
@@ -70,6 +75,9 @@ Actions tab → allow workflows → **Run workflow** (or wait for the cron).
 | `FILE_TTL_MIN` | `10` | file auto-delete window |
 | `WARP_ENABLE` | `1` | bring up the Cloudflare WARP relay |
 | `WARP_PROXY_PORT` | `25344` | local SOCKS5 port for the relay |
+| `TUNNEL_ENABLE` | `1` | enable the quick tunnel for big files |
+| `TUNNEL_TTL_MIN` | `10` | how long a full-quality link lives before auto-wipe |
+| `ADMIN_ID` | — | fixed admin user id (optional; else auto-detected) |
 | `WGCF_PROFILE` | — | optional pre-made WARP WireGuard profile |
 
 Agent handoff instructions live in **[AGENT.md](AGENT.md)**.
