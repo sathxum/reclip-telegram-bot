@@ -38,7 +38,8 @@ class AdminHTTPTests(unittest.TestCase):
     def tearDown(self):
         self.server.close()
 
-    def request(self, path, data=None, cookie=None, csrf=None, origin=True, host=None):
+    def request(self, path, data=None, cookie=None, csrf=None, origin=True, host=None,
+                method=None, extra_headers=None):
         connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
         headers = {'Host': host or 'admin-test.trycloudflare.com'}
         if data is not None:
@@ -49,7 +50,8 @@ class AdminHTTPTests(unittest.TestCase):
             headers['Cookie'] = cookie
         if csrf:
             headers['X-CSRF-Token'] = csrf
-        connection.request('POST' if data is not None else 'GET', path,
+        headers.update(extra_headers or {})
+        connection.request(method or ('POST' if data is not None else 'GET'), path,
                            json.dumps(data) if data is not None else None, headers)
         response = connection.getresponse()
         body = response.read()
@@ -71,6 +73,80 @@ class AdminHTTPTests(unittest.TestCase):
     def api(self, path, meta, cookie, data=None, **kwargs):
         path += ('&' if '?' in path else '?') + 'sid=' + meta['sid']
         return self.request(path, data, cookie, meta['csrf'], **kwargs)
+
+    def test_external_top_level_bootstrap_navigation(self):
+        navigation = {'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate',
+                      'Sec-Fetch-Dest': 'document', 'Referer': 'https://web.telegram.org/'}
+        for path in ('/', '/?sid=untrusted-selector'):
+            for method in ('GET', 'HEAD'):
+                status, headers, body = self.request(path, method=method,
+                                                      extra_headers=navigation)
+                self.assertEqual(status, 200)
+                self.assertEqual(headers['Content-Type'], 'text/html; charset=utf-8')
+                self.assertEqual(headers['Cache-Control'], 'no-store')
+                self.assertEqual(headers['Referrer-Policy'], 'no-referrer')
+                self.assertIn("frame-ancestors 'none'", headers['Content-Security-Policy'])
+                self.assertNotIn('Set-Cookie', headers)
+                self.assertEqual(body, self.server.html if method == 'GET' else b'')
+        self.assertFalse(self.server.sessions)
+        for mode, dest in (('cors', 'empty'), ('no-cors', 'empty'),
+                           ('navigate', 'iframe'), ('navigate', 'frame')):
+            headers = dict(navigation, **{'Sec-Fetch-Mode': mode, 'Sec-Fetch-Dest': dest})
+            self.assertEqual(self.request('/', extra_headers=headers)[0], 403)
+
+    def test_same_origin_redemption_after_external_navigation(self):
+        # Only a synthetic local token; never use a real Telegram launch capability.
+        token = self.server.launch(123).split('#')[1]
+        navigation = {'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate',
+                      'Sec-Fetch-Dest': 'document'}
+        self.assertEqual(self.request('/', extra_headers=navigation)[0], 200)
+        self.assertIn(token, self.server.launches)
+        fetch = {'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'same-origin',
+                 'Sec-Fetch-Dest': 'empty'}
+        status, headers, body = self.request('/api/launch', {'token': token},
+                                              extra_headers=fetch)
+        self.assertEqual(status, 200)
+        meta = json.loads(body)
+        cookie = headers['Set-Cookie'].split(';')[0]
+        self.assertEqual(self.api('/api/session', meta, cookie,
+                                  extra_headers=fetch)[0], 200)
+        self.assertEqual(self.api('/api/logout', meta, cookie, {},
+                                  extra_headers=fetch)[0], 200)
+
+    def test_cross_site_apis_and_launch_remain_denied(self):
+        navigation = {'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate',
+                      'Sec-Fetch-Dest': 'document'}
+        token = self.server.launch(123).split('#')[1]
+        for origin in (True, False, 'https://evil.example'):
+            self.assertEqual(self.request('/api/launch', {'token': token},
+                                          origin=origin, extra_headers=navigation)[0], 403)
+        self.assertIn(token, self.server.launches)
+        self.assertEqual(self.request('/', {}, extra_headers=navigation)[0], 403)
+        meta, cookie, _ = self.authenticate()
+        for method in ('GET', 'HEAD'):
+            for path in ('/api/session', '/api/specs', '/api/preview',
+                         '/api/media-info', '/api/edit?id=x', '/api/download?id=x'):
+                self.assertEqual(self.api(path, meta, cookie, method=method,
+                                          extra_headers=navigation)[0], 403)
+        for path in ('/api/command', '/api/cwd', '/api/edit', '/api/logout'):
+            self.assertEqual(self.api(path, meta, cookie, {},
+                                      extra_headers=navigation)[0], 403)
+
+    def test_forwarded_headers_cannot_override_bootstrap_host(self):
+        navigation = {'Sec-Fetch-Site': 'cross-site', 'Sec-Fetch-Mode': 'navigate',
+                      'Sec-Fetch-Dest': 'document'}
+        expected = 'admin-test.trycloudflare.com'
+        forwarded = dict(navigation, **{'X-Forwarded-Host': expected,
+                                       'Forwarded': 'host=' + expected + ';proto=https'})
+        self.assertEqual(self.request('/', host='evil.example',
+                                      extra_headers=forwarded)[0], 403)
+        # Trusted authority is configured server origin, never reflected proxy input.
+        spoofed = dict(navigation, **{'X-Forwarded-Host': 'evil.example',
+                                     'Forwarded': 'host=evil.example;proto=https'})
+        status, _, body = self.request('/', extra_headers=spoofed)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, self.server.html)
+        self.assertNotIn(b'evil.example', body)
 
     def test_fixed_admin_required(self):
         with self.assertRaises(PermissionError):

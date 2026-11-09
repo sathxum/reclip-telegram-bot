@@ -467,7 +467,16 @@ class AdminServer:
                 parts = urlsplit(owner.origin)
                 if not owner.origin or self.headers.get('Host') != parts.netloc:
                     raise PermissionError('Invalid host.')
-                if self.headers.get('Sec-Fetch-Site') == 'cross-site':
+                # Telegram/external links may initiate cross-site navigation. Only
+                # the inert root HTML may bootstrap this way, never APIs or frames.
+                bootstrap_navigation = (
+                    self.command in ('GET', 'HEAD')
+                    and urlsplit(self.path).path == '/'
+                    and self.headers.get('Sec-Fetch-Mode') == 'navigate'
+                    and self.headers.get('Sec-Fetch-Dest') == 'document'
+                )
+                if (self.headers.get('Sec-Fetch-Site') == 'cross-site'
+                        and not bootstrap_navigation):
                     raise PermissionError('Cross-site request denied.')
                 if self.command == 'POST' and self.headers.get('Origin') != owner.origin:
                     raise PermissionError('Invalid origin.')
