@@ -23,11 +23,14 @@ import threading
 import shutil
 import base64
 import secrets
+import signal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 from datetime import datetime
 
 import requests
+
+from admin_server import AdminServer
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 GH_PAT = os.environ.get("GH_PAT", "").strip()
@@ -80,6 +83,7 @@ def _untrack(*paths):
 # ------------------------------------------------------------ telegram api --
 
 def api(method, data=None, files=None, timeout=90):
+    # Never log transport text/URLs or API descriptions: they may echo credentials.
     url = API + "/" + method
     for _ in range(3):
         try:
@@ -89,10 +93,10 @@ def api(method, data=None, files=None, timeout=90):
                 r = requests.post(url, json=data, timeout=timeout)
             j = r.json()
             if not j.get("ok"):
-                log("api!", method, str(j.get("description"))[:140])
+                log("api!", method, j.get("error_code"))
             return j
         except Exception as exc:
-            log("api-exc", method, exc)
+            log("api-exc", method, type(exc).__name__)
             time.sleep(2)
     return {"ok": False}
 
@@ -186,7 +190,7 @@ def _http_get(url, timeout=120):
             if r.status_code == 200:
                 return r
         except Exception as exc:
-            log("get err", url[:60], exc)
+            log("get err", type(exc).__name__)
             time.sleep(2)
     return None
 
@@ -202,7 +206,7 @@ def _download(url, dest):
                     fh.write(chunk)
         return os.path.getsize(dest) > 0
     except Exception as exc:
-        log("save err", dest, exc)
+        log("save err", type(exc).__name__)
         return False
 
 
@@ -255,7 +259,7 @@ def _ensure_binaries():
                         m.name = "wireproxy"
                         tf.extract(m, WARP_DIR)
         except Exception as exc:
-            log("untar err", exc)
+            log("untar err", type(exc).__name__)
             return None, None
         if not os.path.isfile(wp):
             return None, None
@@ -271,7 +275,7 @@ def _register_profile(wgcf):
         subprocess.run([wgcf, "generate"], cwd=WARP_DIR,
                        capture_output=True, text=True, timeout=150)
     except Exception as exc:
-        log("wgcf err", exc)
+        log("wgcf err", type(exc).__name__)
     return conf_path if os.path.isfile(conf_path) else None
 
 
@@ -283,7 +287,7 @@ def _profile_path(wgcf):
                 fh.write(WGCF_PROFILE_ENV)
             return conf_path
         except Exception as exc:
-            log("profile write err", exc)
+            log("profile write err", type(exc).__name__)
     if os.path.isfile(conf_path):
         return conf_path
     return _register_profile(wgcf)
@@ -352,7 +356,7 @@ def _start_wireproxy(wp, conf_path):
                                 stderr=subprocess.STDOUT)
         PROXY_STATE["proc"] = proc
     except Exception as exc:
-        log("wireproxy start err", exc)
+        log("wireproxy start err", type(exc).__name__)
         return False
     for _ in range(9):
         time.sleep(2)
@@ -592,7 +596,7 @@ def _serve_http():
         log('tunnel: http server on', TUNNEL_PORT)
         httpd.serve_forever()
     except Exception as exc:
-        log('tunnel: http server err', exc)
+        log('tunnel: http server err', type(exc).__name__)
 
 
 def _ensure_cloudflared():
@@ -639,7 +643,7 @@ def setup_tunnel():
                                     stderr=subprocess.STDOUT)
             TUNNEL_STATE['proc'] = proc
         except Exception as exc:
-            log('tunnel: start err', exc)
+            log('tunnel: start err', type(exc).__name__)
             return False
         for _ in range(45):
             time.sleep(2)
@@ -733,6 +737,51 @@ except Exception:
     ADMIN_ID = 0
 
 
+# High-risk tools never inherit first-user auto-admin privileges.
+_ADMIN_WEB = None
+_ADMIN_WEB_LOCK = threading.Lock()
+ADMIN_PORT = int(os.environ.get('ADMIN_PORT', '8792'))
+
+
+def fixed_admin_private(uid, chat_id):
+    return ADMIN_ID > 0 and uid == ADMIN_ID and chat_id == ADMIN_ID
+
+
+def admin_web():
+    global _ADMIN_WEB
+    if ADMIN_ID <= 0 or not TUNNEL_ENABLED:
+        return None
+    with _ADMIN_WEB_LOCK:
+        if _ADMIN_WEB is None:
+            server = AdminServer(ADMIN_ID, DEADLINE, _cleanup, ADMIN_PORT, os.getcwd())
+            if not server.start():
+                return None
+            _ADMIN_WEB = server
+        cf = _ensure_cloudflared()
+        if not cf or not _ADMIN_WEB.ensure_tunnel(cf):
+            return None
+        return _ADMIN_WEB
+
+
+def handle_cmd(chat_id, uid):
+    if not fixed_admin_private(uid, chat_id):
+        send_message(chat_id, '⛔ Fixed ADMIN_ID and a private admin chat are required.')
+        return
+    try:
+        server = admin_web()
+        if not server:
+            raise ValueError('Unavailable')
+        link = server.launch(uid)
+        send_message(chat_id,
+                     '🖥 <b>Runner Terminal</b>\nOpen within 90 seconds. Session expires after '
+                     '10 minutes or runner exit. Commands run as the actual bot OS user '
+                     '(not a sandbox); avoid printing credentials. Non-interactive Bash, '
+                     '30s command limit. Use the directory control for persistent cwd.',
+                     {'inline_keyboard': [[{'text': '🖥 Open secure terminal', 'url': link}]]})
+    except Exception:
+        send_message(chat_id, '⚠️ Admin terminal unavailable. Check fixed ADMIN_ID and tunnel configuration.')
+
+
 def _gh_headers():
     return {'Authorization': 'Bearer ' + GH_PAT,
             'Accept': 'application/vnd.github+json'}
@@ -763,7 +812,7 @@ def _ensure_state_branch():
                           timeout=20)
         return c.status_code in (200, 201)
     except Exception as exc:
-        log('state: branch err', exc)
+        log('state: branch err', type(exc).__name__)
         return False
 
 
@@ -781,7 +830,7 @@ def stats_load():
             STATS['_sha'] = j.get('sha')
             log('state: loaded | boots', STATS.get('boots'))
     except Exception as exc:
-        log('state: load err', exc)
+        log('state: load err', type(exc).__name__)
 
 
 def stats_save():
@@ -800,7 +849,7 @@ def stats_save():
         if r.status_code in (200, 201):
             STATS['_sha'] = r.json()['content']['sha']
     except Exception as exc:
-        log('state: save err', exc)
+        log('state: save err', type(exc).__name__)
 
 
 def stats_loop():
@@ -998,7 +1047,7 @@ def _ffmpeg(args, timeout=2700):
                            timeout=timeout)
         return r.returncode == 0
     except Exception as exc:
-        log("ffmpeg err", exc)
+        log("ffmpeg err", type(exc).__name__)
         return False
 
 
@@ -1256,7 +1305,7 @@ def fetch_and_prompt(chat_id, url):
             try:
                 ensure_warp()
             except Exception as exc:
-                log("fetch: warp ensure failed", exc)
+                log("fetch: warp ensure failed", type(exc).__name__)
         info, err = yt_info(url)
         stop.set()
         if not info:
@@ -1311,7 +1360,7 @@ def fetch_and_prompt(chat_id, url):
                 pass
         edit_message(chat_id, mid, cap, markup)
     except Exception as exc:
-        log("fetch exc", exc)
+        log("fetch exc", type(exc).__name__)
     finally:
         with _LOCK:
             _INFLIGHT_URLS.discard(url)
@@ -1319,21 +1368,25 @@ def fetch_and_prompt(chat_id, url):
 
 # --------------------------------------------------------------- delivering --
 
-def deliver_thread(chat_id, jid, mode, height, cb_id):
+def deliver_thread(chat_id, jid, mode, height, cb_id, delivery=None):
     _SEM.acquire()
     try:
-        deliver(chat_id, jid, mode, height, cb_id)
+        deliver(chat_id, jid, mode, height, cb_id, delivery)
     except Exception as exc:
-        log("deliver exc", exc)
+        log("deliver exc", type(exc).__name__)
     finally:
         _SEM.release()
 
 
-def deliver(chat_id, jid, mode, height=None, cb_id=None):
+def deliver(chat_id, jid, mode, height=None, cb_id=None, delivery=None):
     job = JOBS.get(jid)
     if not job:
         if cb_id:
             answer_cb(cb_id, "This request expired, send the link again.")
+        return
+    if job['chat_id'] != chat_id:
+        return
+    if delivery and not fixed_admin_private(chat_id, chat_id):
         return
     url = job["url"]
     info = job["info"]
@@ -1341,7 +1394,7 @@ def deliver(chat_id, jid, mode, height=None, cb_id=None):
     dur = info.get("duration")
     mid = job.get("msg_id")
     safe = "".join(c for c in title if c not in '\\/:*?"<>|').strip()[:80] or "video"
-    out_base = os.path.join(DL, f"{jid}_{safe}")
+    out_base = os.path.join(DL, f"{jid}_{secrets.token_hex(6)}_{safe}")
 
     if mode == "audio":
         opts = ["-f", "bestaudio/best", "-x", "--audio-format", "mp3",
@@ -1389,6 +1442,25 @@ def deliver(chat_id, jid, mode, height=None, cb_id=None):
     stats_bump("downloads")
     stats_bump("bytes", size)
 
+    if delivery == 'studio' and kind == 'video':
+        try:
+            server = admin_web()
+            if not server:
+                raise ValueError('Unavailable')
+            link = server.launch(chat_id, 'studio', path, title)
+            text = ('🎬 <b>Video Studio</b>\nPreview, choose up to 8 trim segments, optionally '
+                    'crop in pixels, then download your edited MP4. Open within 90 seconds; '
+                    'session and media expire in 10 minutes or at runner exit.')
+            markup = {'inline_keyboard': [[{'text': '🎬 Open secure Video Studio', 'url': link}]]}
+            if mid:
+                edit_message(chat_id, mid, text, markup)
+            else:
+                send_message(chat_id, text, markup)
+        except Exception:
+            _cleanup([path])
+            send_message(chat_id, '⚠️ Studio unavailable. Please retry or choose Telegram delivery.')
+        return
+
     # small enough -> deliver straight into the chat
     if size <= TG_LIMIT:
         if mid:
@@ -1409,7 +1481,7 @@ def deliver(chat_id, jid, mode, height=None, cb_id=None):
         return
 
     # too big for Telegram -> serve FULL quality through the Cloudflare tunnel
-    link = create_share(path, title, kind)
+    link = create_share(path, title, kind) if delivery != 'telegram' else None
     if link:
         _tunnel_msg(chat_id, mid, link, title, size, dur)
         return
@@ -1496,6 +1568,13 @@ def handle_update(upd):
         name = chat.get("first_name") or chat.get("title") or "there"
         set_admin_if_needed(chat_id, name)
         text = m.get("text") or m.get("caption") or ""
+        uid = (m.get('from') or {}).get('id')
+        if text.split('@', 1)[0].split(' ', 1)[0] == '/cmd':
+            if fixed_admin_private(uid, chat_id):
+                threading.Thread(target=handle_cmd, args=(chat_id, uid), daemon=True).start()
+            else:
+                handle_cmd(chat_id, uid)
+            return
         if text.startswith("/start"):
             handle_start(chat_id, name)
             return
@@ -1539,6 +1618,29 @@ def handle_update(upd):
         msg = cb.get("message") or {}
         chat_id = (msg.get("chat") or {}).get("id")
         mid = msg.get("message_id")
+        uid = (cb.get('from') or {}).get('id')
+        if data.startswith(('v:', 'a:', 't:', 'u:', 'x:')):
+            pieces = data.split(':')
+            job = JOBS.get(pieces[1]) if len(pieces) > 1 else None
+            if not job or job['chat_id'] != chat_id:
+                answer_cb(cb_id, 'This request is not yours or has expired.')
+                return
+            # Admin job buttons cannot be exercised by another group member.
+            if chat_id == ADMIN_ID and uid != ADMIN_ID:
+                answer_cb(cb_id, 'Admin only.')
+                return
+        if data.startswith(('t:', 'u:')):
+            if not fixed_admin_private(uid, chat_id):
+                answer_cb(cb_id, 'Fixed admin only, in a private chat.')
+                return
+            parts = data.split(':')
+            height = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() and int(parts[2]) > 0 else None
+            delivery = 'telegram' if parts[0] == 't' else 'studio'
+            answer_cb(cb_id, 'Download started…')
+            threading.Thread(target=deliver_thread,
+                             args=(chat_id, parts[1], 'video', height, None, delivery),
+                             daemon=True).start()
+            return
         if data == "help":
             answer_cb(cb_id)
             handle_help(chat_id, mid)
@@ -1556,6 +1658,14 @@ def handle_update(upd):
             edit_message(chat_id, mid, "👋 <b>Send me a link to get started!</b> 🔗", main_menu(chat_id))
         elif data.startswith("v:"):
             parts = data.split(":")
+            if fixed_admin_private(uid, chat_id):
+                answer_cb(cb_id, 'Choose delivery')
+                height_value = parts[2] if len(parts) > 2 and parts[2].isdigit() else '0'
+                send_message(chat_id, '🎬 <b>Choose video delivery</b>\nTelegram video or secure browser Video Studio?',
+                             {'inline_keyboard': [[
+                                 {'text': '📨 Telegram video', 'callback_data': f't:{parts[1]}:{height_value}'},
+                                 {'text': '🎬 URL · Video Studio', 'callback_data': f'u:{parts[1]}:{height_value}'}]]})
+                return
             height = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() and int(parts[2]) > 0 else None
             answer_cb(cb_id, "🚀 Download started…")
             threading.Thread(target=deliver_thread,
@@ -1595,7 +1705,7 @@ def janitor_loop():
                 except OSError:
                     pass
         except Exception as exc:
-            log("janitor exc", exc)
+            log("janitor exc", type(exc).__name__)
 
 
 # ------------------------------------------------------------------ main ----
@@ -1615,7 +1725,7 @@ def trigger_rerun():
                 _DISPATCH["ok"] = True
                 return True
         except Exception as exc:
-            log("rerun exc", exc)
+            log("rerun exc", type(exc).__name__)
         time.sleep(5)
     return False
 
@@ -1668,14 +1778,16 @@ def main():
                 try:
                     handle_update(upd)
                 except Exception as exc:
-                    log("handle exc", exc)
+                    log("handle exc", type(exc).__name__)
         except KeyboardInterrupt:
             break
         except Exception as exc:
-            log("loop exc", exc)
+            log("loop exc", type(exc).__name__)
             time.sleep(3)
     log("runtime budget reached, exiting")
     stats_save()
+    if _ADMIN_WEB:
+        _ADMIN_WEB.close()
     _kill_tunnel()
     _kill_proxy()
     if not _DISPATCH["ok"]:
@@ -1683,4 +1795,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # Atexit closes the ephemeral admin server on graceful runner termination.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     main()

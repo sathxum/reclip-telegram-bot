@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<title>Reclip · Private workspace</title>
+<script>
+(() => {
+  'use strict';
+  let launchToken = location.hash.slice(1);
+  if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+  try {
+    launchToken = launchToken.startsWith('token=') ? new URLSearchParams(launchToken).get('token') : decodeURIComponent(launchToken);
+  } catch (_) { launchToken = ''; }
+  let sid = new URLSearchParams(location.search).get('sid') || '';
+  const scoped = path => path + (path.includes('?') ? '&' : '?') + 'sid=' + encodeURIComponent(sid);
+  let csrf = '', active = false, terminalBusy = false, editing = false, jobId = null;
+  let duration = 0, mediaWidth = 0, mediaHeight = 0, previewEnd = null;
+  let pollTimer, expiryTimer, sessionEpoch = 0;
+  const historyItems = [];
+  let historyIndex = 0, draft = '';
+  const $ = id => document.getElementById(id);
+  async function api(path, body, bootstrap = false) {
+    if (!bootstrap && !active) throw new Error('This session is closed. Open a fresh private launch link.');
+    const epoch = sessionEpoch;
+    const options = {method: body === undefined ? 'GET' : 'POST', credentials: 'same-origin', mode: 'same-origin', cache: 'no-store', redirect: 'error', headers: {Accept: 'application/json'}};
+    if (body !== undefined) {
+      options.headers['Content-Type'] = 'application/json';
+      if (!bootstrap) options.headers['X-CSRF-Token'] = csrf;
+      options.body = JSON.stringify(body);
+    }
+    let response;
+    try { response = await fetch(path === '/api/launch' ? path : scoped(path), options); }
+    catch (_) { throw new Error('Connection failed. Check your connection and try again.'); }
+    if (!bootstrap && epoch !== sessionEpoch) throw new Error('This session has closed.');
+    let data;
+    try { data = await response.json(); } catch (_) { data = {}; }
+    if (!bootstrap && epoch !== sessionEpoch) throw new Error('This session has closed.');
+    if (!response.ok) {
+      if (!bootstrap && (response.status === 401 || response.status === 403)) closeSession('Session expired or authorization denied. Open a fresh private launch link.');
+      throw new Error(typeof data.error === 'string' ? data.error : 'Request failed (' + response.status + '). Please try again.');
+    }
+    return data;
+  }
+  // Begin token exchange immediately; never write the launch token to DOM or storage.
+  const authentication = (launchToken ? api('/api/launch', {token: launchToken}, true) : api('/api/session', undefined, true))
+    .then(data => ({data}), error => ({error}));
+  launchToken = '';
+  document.addEventListener('DOMContentLoaded', () => {
+    const announce = (id, message, error = false) => {
+      $(id).textContent = message;
+      $(id).classList.toggle('error-text', error);
+    };
+    function setTerminalBusy(busy) {
+      terminalBusy = busy;
+      $('terminal-controls').disabled = busy || !active;
+      $('run-command').textContent = busy ? 'Running…' : 'Run command';
+      $('terminal-panel').setAttribute('aria-busy', String(busy));
+    }
+    function setEditing(busy) {
+      editing = busy;
+      $('edit-controls').disabled = busy || !active;
+      $('render').textContent = busy ? 'Rendering…' : 'Render edited video';
+      $('studio-panel').setAttribute('aria-busy', String(busy));
+      updateEstimate();
+    }
+    window.addEventListener('pagehide', () => { clearTimeout(pollTimer); clearInterval(expiryTimer); $('video').pause(); });
+    window.addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
+    $('logout').addEventListener('click', async () => {
+      $('logout').disabled = true;
+      try { await api('/api/logout', {}); closeSession('Signed out. Open a fresh launch link to reconnect.'); }
+      catch (error) { announce('global-status', error.message, true); if (active) $('logout').disabled = false; }
+    });
+    $('refresh-specs').addEventListener('click', loadSpecs);
+    async function loadSpecs() {
+      $('refresh-specs').disabled = true;
+      announce('specs-status', 'Loading runner details…');
+      try {
+        const specs = await api('/api/specs');
+        if (!active) return;
+        const fields = {os: 'OS', cpu: 'Processor', cores: 'CPU cores', memory_gib: 'Memory · GiB', disk_gib: 'Disk · GiB', shell: 'Shell'};
+        $('specs').replaceChildren();
+        Object.entries(fields).forEach(([key, label]) => {
+          const cell = document.createElement('div'), dt = document.createElement('dt'), dd = document.createElement('dd');
+          dt.textContent = label; dd.textContent = specs[key] == null ? 'Unavailable' : String(specs[key]);
+          cell.append(dt, dd); $('specs').append(cell);
+        });
+        if (!terminalBusy && typeof specs.cwd === 'string') setCwd(specs.cwd);
+        announce('specs-status', 'Runner details updated.');
+      } catch (error) { announce('specs-status', error.message, true); }
+      finally { $('refresh-specs').disabled = !active; }
+    }
+    function setCwd(path) { $('cwd').value = path; $('current-cwd').textContent = path; }
+    $('cwd-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      if (!active || terminalBusy) return;
+      const path = $('cwd').value.trim();
+      if (!path) { announce('terminal-status', 'Enter a directory path.', true); $('cwd').focus(); return; }
+      setTerminalBusy(true); announce('terminal-status', 'Changing directory…');
+      try { const data = await api('/api/cwd', {path}); setCwd(data.cwd); announce('terminal-status', 'Working directory updated.'); }
+      catch (error) { announce('terminal-status', error.message, true); }
+      finally { setTerminalBusy(false); }
+    });
+    $('command-form').addEventListener('submit', runCommand);
+    $('command').addEventListener('keydown', event => {
+      if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); $('command-form').requestSubmit(); }
+    });
+    document.querySelectorAll('[data-command]').forEach(button => button.addEventListener('click', () => {
+      $('command').value = button.dataset.command; $('command').focus();
+      announce('terminal-status', 'Command inserted. Review it, then run.');
+    }));
+    function recall(direction) {
+      if (!historyItems.length) return;
+      if (historyIndex === historyItems.length) draft = $('command').value;
+      historyIndex = Math.max(0, Math.min(historyItems.length, historyIndex + direction));
+      $('command').value = historyIndex === historyItems.length ? draft : historyItems[historyIndex];
+      $('command').focus();
+      announce('terminal-status', historyIndex === historyItems.length ? 'Current draft.' : 'History ' + (historyIndex + 1) + ' of ' + historyItems.length + '.');
+    }
+    $('history-prev').addEventListener('click', () => recall(-1));
+    $('history-next').addEventListener('click', () => recall(1));
+    $('clear-output').addEventListener('click', () => { $('output').textContent = ''; announce('terminal-status', 'Output cleared.'); });
+    async function runCommand(event) {
+      event.preventDefault();
+      if (!active || terminalBusy) return;
+      const command = $('command').value;
+      if (!command.trim()) { announce('terminal-status', 'Enter a command first.', true); $('command').focus(); return; }
+      historyItems.push(command); if (historyItems.length > 50) historyItems.shift();
+      historyIndex = historyItems.length; draft = '';
+      setTerminalBusy(true); announce('terminal-status', 'Command running. Waiting for the runner…');
+      $('output').textContent = '$ ' + command + '\n\n';
+      try {
+        const data = await api('/api/command', {command});
+        if (!active) return;
+        $('output').textContent += String(data.output ?? '');
+        if (data.cwd != null) setCwd(String(data.cwd));
+        const notes = ['Exit code ' + data.returncode];
+        if (data.timed_out) notes.push('time limit reached');
+        if (data.truncated) notes.push('output truncated');
+        announce('terminal-status', notes.join(' · '), data.returncode !== 0 || Boolean(data.timed_out));
+      } catch (error) { announce('terminal-status', error.message, true); }
+      finally { setTerminalBusy(false); }
+    }
+    function parseTime(value) {
+      const text = value.trim();
+      if (/^\d+(?:\.\d+)?$/.test(text)) return Number(text);
+      const parts = /^(\d+):([0-5]\d):([0-5]\d(?:\.\d+)?)$/.exec(text);
+      return parts ? Number(parts[1]) * 3600 + Number(parts[2]) * 60 + Number(parts[3]) : NaN;
+    }
+    function formatTime(seconds) {
+      const ms = Math.floor(seconds * 1000), whole = Math.floor(ms / 1000);
+      return String(Math.floor(whole / 3600)).padStart(2, '0') + ':' + String(Math.floor(whole / 60) % 60).padStart(2, '0') + ':' + String(whole % 60).padStart(2, '0') + (ms % 1000 ? '.' + String(ms % 1000).padStart(3, '0') : '');
+    }
+    function readSegment(row) {
+      const start = parseTime(row.querySelector('[data-time="start"]').value), end = parseTime(row.querySelector('[data-time="end"]').value);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end - start < 0.05 || end > duration) throw new Error('Each segment needs at least 0.05 seconds and 0 ≤ start < end ≤ ' + formatTime(duration) + '. Use seconds or hh:mm:ss.');
+      return {start, end};
+    }
+    function updateEstimate() {
+      const rows = [...$('segments').children];
+      $('add-segment').disabled = rows.length >= 8 || editing || !active;
+      $('segment-count').textContent = rows.length + ' / 8 segments';
+      try { const total = rows.map(readSegment).reduce((sum, item) => sum + item.end - item.start, 0); $('estimate').textContent = 'Estimated output · ' + formatTime(total); }
+      catch (_) { $('estimate').textContent = 'Estimated output · check segment times'; }
+    }
+    function addSegment(start = 0, end = duration) {
+      if ($('segments').children.length >= 8) return;
+      const row = $('segment-template').content.firstElementChild.cloneNode(true);
+      const number = (addSegment.counter = (addSegment.counter || 0) + 1);
+      row.querySelector('.segment-name').textContent = 'Segment ' + number;
+      ['start', 'end'].forEach(type => {
+        const input = row.querySelector('[data-time="' + type + '"]');
+        input.id = 'segment-' + number + '-' + type;
+        row.querySelector('[data-label="' + type + '"]').htmlFor = input.id;
+        input.value = formatTime(type === 'start' ? start : end);
+        input.addEventListener('input', () => { invalidateDownload(); updateEstimate(); });
+        row.querySelector('[data-set="' + type + '"]').addEventListener('click', () => {
+          input.value = formatTime(Math.max(0, Math.min(duration, $('video').currentTime || 0))); invalidateDownload(); updateEstimate();
+        });
+      });
+      row.querySelector('[data-remove]').addEventListener('click', () => {
+        row.remove(); stopPreview(); invalidateDownload(); updateEstimate(); $('add-segment').focus();
+      });
+      row.querySelector('[data-preview]').addEventListener('click', async () => {
+        try {
+          const segment = readSegment(row); stopPreview(); $('video').currentTime = segment.start; previewEnd = segment.end;
+          await $('video').play(); announce('studio-status', 'Previewing ' + row.querySelector('.segment-name').textContent.toLowerCase() + '.');
+        } catch (error) { stopPreview(); announce('studio-status', error.message, true); }
+      });
+      $('segments').append(row); invalidateDownload(); updateEstimate();
+    }
+    function stopPreview() { previewEnd = null; $('video').pause(); }
+    $('stop-preview').addEventListener('click', stopPreview);
+    $('video').addEventListener('timeupdate', () => {
+      $('playhead').textContent = formatTime($('video').currentTime || 0);
+      if (previewEnd !== null && $('video').currentTime >= previewEnd) { $('video').pause(); $('video').currentTime = previewEnd; previewEnd = null; }
+    });
+    $('video').addEventListener('seeking', () => { if (previewEnd !== null && $('video').currentTime > previewEnd) stopPreview(); });
+    $('video').addEventListener('error', () => announce('studio-status', 'Preview could not load. Your browser may not support this media; editing is still available.', true));
+    $('add-segment').addEventListener('click', () => { addSegment(); $('segments').lastElementChild.querySelector('input').focus(); });
+    $('crop-enabled').addEventListener('change', () => { $('crop-fields').hidden = !$('crop-enabled').checked; invalidateDownload(); });
+    document.querySelectorAll('#crop-fields input').forEach(input => input.addEventListener('input', invalidateDownload));
+    function invalidateDownload() { $('download').hidden = true; $('download').removeAttribute('href'); }
+    function readCrop() {
+      if (!$('crop-enabled').checked) return null;
+      const crop = {};
+      for (const key of ['x', 'y', 'width', 'height']) {
+        const value = $('crop-' + key).value.trim();
+        if (!/^\d+$/.test(value)) throw new Error('Crop values must be whole, non-negative pixels.');
+        crop[key] = Number(value);
+        if (!Number.isSafeInteger(crop[key])) throw new Error('Crop values are too large.');
+      }
+      if (crop.width < 2 || crop.height < 2 || crop.x % 2 || crop.y % 2 || crop.width % 2 || crop.height % 2) throw new Error('All crop coordinates must be even pixels; width and height at least 2.');
+      if (crop.x + crop.width > mediaWidth || crop.y + crop.height > mediaHeight) throw new Error('Crop must fit inside the source (' + mediaWidth + ' × ' + mediaHeight + ').');
+      return crop;
+    }
+    $('edit-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      if (!active || editing) return;
+      let payload;
+      try {
+        const segments = [...$('segments').children].map(readSegment);
+        if (!segments.length || segments.length > 8) throw new Error('Add between 1 and 8 segments.');
+        let previous = 0, total = 0;
+        for (const segment of segments) {
+          if (segment.start < previous) throw new Error('Segments must be in playback order and cannot overlap. Adjust each start/end before rendering.');
+          previous = segment.end; total += segment.end - segment.start;
+        }
+        if (total > 600) throw new Error('Edited output is limited to 10 minutes. Shorten your segments.');
+        payload = {segments, crop: readCrop()};
+      } catch (error) { announce('studio-status', error.message, true); return; }
+      invalidateDownload(); stopPreview(); setEditing(true); announce('studio-status', 'Submitting edit…');
+      try {
+        const data = await api('/api/edit', payload);
+        if (typeof data.job !== 'string' && typeof data.job !== 'number') throw new Error('The runner returned no job ID.');
+        jobId = String(data.job); await pollJob();
+      } catch (error) { announce('studio-status', error.message + ' Submission was not automatically retried.', true); setEditing(false); }
+    });
+    async function pollJob() {
+      if (!active || jobId === null) return;
+      $('retry-poll').hidden = true;
+      try {
+        const data = await api('/api/edit?id=' + encodeURIComponent(jobId));
+        if (!active) return;
+        if (data.status === 'running') {
+          announce('studio-status', 'Rendering your edit… You can keep this tab open.');
+          pollTimer = setTimeout(pollJob, 1800);
+        } else if (data.status === 'done') {
+          $('download').href = scoped('/api/download?id=' + encodeURIComponent(jobId)); $('download').hidden = false;
+          announce('studio-status', 'Edit ready. Download your edited video below.'); setEditing(false); updateEstimate();
+        } else if (data.status === 'failed') {
+          announce('studio-status', typeof data.error === 'string' ? data.error : 'The edit failed. Adjust your selection and try again.', true); setEditing(false); updateEstimate();
+        } else { throw new Error('Unexpected job status.'); }
+      } catch (error) {
+        announce('studio-status', error.message + ' Use “Check job again” to resume polling the same edit.', true);
+        $('retry-poll').hidden = !active;
+      }
+    }
+    $('retry-poll').addEventListener('click', pollJob);
+    $('retry-media').addEventListener('click', loadMedia);
+    async function loadMedia() {
+      $('retry-media').hidden = true; announce('studio-status', 'Loading media information…');
+      try {
+        const data = await api('/api/media-info');
+        duration = Number(data.duration); mediaWidth = Number(data.width); mediaHeight = Number(data.height);
+        if (!Number.isFinite(duration) || duration <= 0) throw new Error('The media has no valid duration.');
+        $('media-title').textContent = data.title || 'Untitled media';
+        $('media-meta').textContent = formatTime(duration) + ' · ' + mediaWidth + ' × ' + mediaHeight;
+        $('video').src = scoped('/api/preview');
+        $('crop-width').value = Math.floor(mediaWidth / 2) * 2; $('crop-height').value = Math.floor(mediaHeight / 2) * 2;
+        $('crop-enabled').disabled = data.crop_safe === false || !(mediaWidth >= 2 && mediaHeight >= 2);
+        if (data.crop_safe === false) { $('crop-enabled').checked = false; $('crop-fields').hidden = true; $('media-meta').textContent += ' · pixel crop unavailable for rotated/anamorphic source'; }
+        setEditing(false); if (!$('segments').children.length) addSegment();
+        announce('studio-status', 'Select your segments in playback order, then render.');
+      } catch (error) { announce('studio-status', error.message, true); $('retry-media').hidden = !active; }
+    }
+    authentication.then(result => {
+      if (result.error) { closeSession(result.error.message + ' Open a fresh private launch link if needed.'); return; }
+      const meta = result.data;
+      if (typeof meta.csrf !== 'string' || !meta.csrf || !['admin', 'terminal', 'studio'].includes(meta.kind)) {
+        closeSession('Invalid session metadata. Open a fresh private launch link.'); return;
+      }
+      sid = meta.sid;
+      history.replaceState(null, '', '/?sid=' + encodeURIComponent(sid));
+      csrf = meta.csrf; active = true;
+      $('workspace-title').textContent = meta.title || 'Private workspace';
+      $('kind-label').textContent = meta.kind === 'studio' ? 'Video studio' : 'Runner console';
+      $('session-dot').classList.add('connected'); $('session-label').textContent = 'Connected';
+      $('logout').disabled = false; $('workspace').hidden = false; $('welcome').hidden = true;
+      announce('global-status', 'Private session connected.');
+      $('terminal-panel').hidden = meta.kind === 'studio'; $('studio-panel').hidden = meta.kind !== 'studio';
+      $('runner-panel').hidden = meta.kind === 'studio';
+      if (meta.kind === 'studio') loadMedia(); else { loadSpecs(); setTerminalBusy(false); }
+      const raw = meta.expires;
+      const expiry = typeof raw === 'number' ? (raw < 1e12 ? raw * 1000 : raw) : Date.parse(raw);
+      if (Number.isFinite(expiry)) {
+        const tick = () => {
+          const remaining = expiry - Date.now();
+          if (remaining <= 0) { closeSession('This session has expired. Open a fresh private launch link.'); return; }
+          $('expiry').textContent = 'Expires in ' + Math.ceil(remaining / 60000) + ' min';
+        };
+        expiryTimer = setInterval(tick, 1000); tick();
+      } else { $('expiry').textContent = 'Ephemeral session'; }
+    });
+  });
+  function closeSession(message) {
+    active = false; csrf = ''; sessionEpoch++; clearTimeout(pollTimer); clearInterval(expiryTimer);
+    $('workspace').hidden = true; $('welcome').hidden = false;
+    $('welcome-title').textContent = 'Session unavailable'; $('welcome-detail').textContent = message;
+    $('global-status').textContent = message; $('global-status').classList.add('error-text');
+    $('logout').disabled = true; $('session-dot').classList.remove('connected'); $('session-label').textContent = 'Disconnected';
+    $('expiry').textContent = ''; $('video').pause(); $('video').removeAttribute('src'); $('video').load();
+    $('workspace-title').textContent = 'Your private control room.'; $('media-title').textContent = ''; $('media-meta').textContent = '';
+    $('download').hidden = true; $('download').removeAttribute('href');
+    $('command').value = ''; $('output').textContent = ''; $('cwd').value = ''; $('current-cwd').textContent = '';
+    $('specs').replaceChildren(); $('segments').replaceChildren(); historyItems.length = 0;
+    $('welcome-title').focus();
+  }
+})();
+</script>
+<style>
+:root{color-scheme:dark;--bg:#0b1017;--panel:#121a25;--line:#273343;--muted:#a2afc2;--text:#edf3fc;--accent:#9af2ce;--error:#ffb4bb;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:15px}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 80% 0,#17352f55,transparent 45%),var(--bg);color:var(--text);line-height:1.5;min-height:100vh}button,input,textarea{font:inherit}button,a,input,textarea,summary{touch-action:manipulation}button,.button{min-height:44px;border:1px solid var(--line);border-radius:10px;background:#1b2736;color:var(--text);padding:10px 16px;font-weight:600;cursor:pointer;text-decoration:none;display:inline-flex;justify-content:center;align-items:center;gap:8px}button:hover,.button:hover{background:#293a4f;border-color:#577087}button:disabled{opacity:.5;cursor:not-allowed}.primary{background:var(--accent);color:#072b21;border-color:var(--accent)}.primary:hover{background:#c4ffe6;border-color:#c4ffe6}.quiet{background:transparent}input,textarea{width:100%;border:1px solid #3a495c;border-radius:9px;padding:11px 12px;background:#0b121c;color:var(--text);min-height:44px}textarea{resize:vertical;min-height:145px;line-height:1.65;tab-size:2}input::placeholder,textarea::placeholder{color:#8a9aad}input[type=checkbox]{width:20px;height:20px;min-height:20px;accent-color:var(--accent);flex-shrink:0}label{display:block;font-size:.86rem;color:#c5cfde;font-weight:600;margin-bottom:7px}fieldset{border:0;padding:0;margin:0;min-width:0}legend{font-weight:700;margin-bottom:12px}h1,h2,h3,p{margin-top:0}h1{font-size:clamp(1.55rem,4vw,2.2rem);letter-spacing:-.04em;margin-bottom:7px;overflow-wrap:anywhere}h2{font-size:1.15rem;letter-spacing:-.02em;margin-bottom:6px}h3{font-size:1rem}p{color:var(--muted)}[hidden]{display:none!important}:focus-visible{outline:3px solid var(--accent);outline-offset:3px}header,main,footer{max-width:1120px;margin:auto;padding-left:28px;padding-right:28px}header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding-top:28px;padding-bottom:28px;border-bottom:1px solid var(--line)}.brand{display:flex;gap:12px;align-items:center}.mark{width:40px;height:40px;background:var(--accent);color:#082d24;border-radius:12px;display:grid;place-items:center;font-weight:900;font-size:22px}.brand-name{font-weight:800;letter-spacing:.14em;font-size:.9rem}.eyebrow{text-transform:uppercase;letter-spacing:.14em;font-size:.7rem;font-weight:700;color:var(--accent);margin-bottom:7px}.subtle,.hint{font-size:.82rem;color:var(--muted)}main{padding-top:30px;padding-bottom:32px}.intro{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:20px}.connection{display:flex;align-items:center;gap:8px;font-size:.83rem;color:var(--muted);white-space:nowrap}.dot{width:7px;height:7px;border-radius:50%;background:#8a97aa}.dot.connected{background:var(--accent);box-shadow:0 0 10px #9af2ce55}.panel{background:linear-gradient(145deg,#151f2c,#111923);border:1px solid var(--line);border-radius:18px;padding:24px;margin-bottom:20px;box-shadow:0 8px 35px #0002}.panel-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:18px}.panel-heading p{margin-bottom:0}.specs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px 24px;margin:0}.specs dt{color:var(--muted);font-size:.75rem;margin-bottom:4px}.specs dd{margin:0;font-weight:600;overflow-wrap:anywhere}.status{min-height:23px;font-size:.84rem;color:var(--muted);margin:12px 0 0;overflow-wrap:anywhere}.error-text{color:var(--error)!important}.global{margin:0 0 20px}.row{display:flex;gap:10px;align-items:end}.row>.grow{flex:1;min-width:0}.space{margin-top:18px}.wrap{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.quick button{font-size:.8rem;padding:8px 12px}.mono,textarea,pre{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.cwd-display{font-size:.8rem;overflow-wrap:anywhere;margin-bottom:14px}.terminal-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:22px;margin-bottom:10px}.terminal-bar span{font-size:.72rem;text-transform:uppercase;letter-spacing:.13em;color:var(--muted)}pre{background:#070c12;border:1px solid var(--line);border-radius:12px;min-height:150px;max-height:460px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;margin:0;padding:18px;font-size:.84rem;line-height:1.65}pre:empty:before{content:"Command output will appear here.";color:#8b9bad}.studio-grid{display:grid;grid-template-columns:minmax(0,1.08fr) minmax(0,1fr);gap:24px}.media-side{min-width:0}video{width:100%;max-height:450px;background:#070c12;border-radius:12px;border:1px solid var(--line);display:block}.playback{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-top:12px}.segment{background:#0c1420;border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:12px}.segment-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.segment-name{font-weight:650;font-size:.9rem}.segment-top button{font-size:.8rem}.time-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.time-grid button{font-size:.75rem;width:100%;padding:8px;margin-top:8px}.segment-actions{margin-top:12px}.count{font-size:.8rem;color:var(--muted)}.check-label{display:flex;align-items:center;gap:10px;min-height:44px;font-size:.9rem;cursor:pointer}.crop-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.divider{border-top:1px solid var(--line);padding-top:18px;margin-top:20px}.render-row{display:flex;gap:10px;flex-wrap:wrap}.render-row .primary{flex:1}.notice{max-width:600px;margin:40px auto;padding:36px;text-align:center}.notice h2{font-size:1.5rem}.notice p{margin-bottom:0}footer{padding-bottom:28px;color:var(--muted);font-size:.75rem;display:flex;justify-content:space-between;gap:12px}noscript{display:block;padding:24px;color:var(--error)}.media-title{overflow-wrap:anywhere}#download{background:#9af2ce16;border-color:#9af2ce77;color:var(--accent);margin-top:12px}#estimate{color:var(--accent);font-size:.88rem;margin:14px 0}details>summary{cursor:pointer;min-height:44px;padding-top:10px;color:#cad6e5;font-size:.86rem}details p{font-size:.8rem;margin:8px 0 0}
+@media(max-width:850px){.studio-grid{grid-template-columns:1fr}.specs{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:520px){header,main,footer{padding-left:16px;padding-right:16px}header{padding-top:18px;padding-bottom:18px}.panel{padding:18px;border-radius:14px}.intro{align-items:flex-start;flex-direction:column;gap:8px}.panel-heading{gap:8px}.panel-heading .quiet{padding:9px 11px}.row{flex-wrap:wrap}.row>.grow{flex-basis:100%}.row>button{width:100%}.specs{gap:16px}.time-grid{gap:8px}.segment{padding:12px}footer{flex-direction:column;gap:4px}.notice{padding:24px}.connection{white-space:normal}}
+@media(prefers-reduced-motion:no-preference){button,.button{transition:background .15s,border-color .15s}}
+</style>
+</head>
+<body>
+<header><div class="brand"><div class="mark" aria-hidden="true">R</div><div><div class="brand-name">RECLIP</div><div class="subtle">Private workspace</div></div></div><button id="logout" class="quiet" disabled>Sign out</button></header>
+<main>
+<div class="intro"><div><div class="eyebrow" id="kind-label">Secure workspace</div><h1 id="workspace-title">Your private control room.</h1><div class="subtle" id="expiry"></div></div><div class="connection"><span class="dot" id="session-dot" aria-hidden="true"></span><span id="session-label">Connecting…</span></div></div>
+<p id="global-status" class="status global" role="status" aria-live="polite">Establishing your private session…</p>
+<noscript>JavaScript is required. Enable it, then reopen your private launch link.</noscript>
+<section id="welcome" class="panel notice" aria-labelledby="welcome-title"><div class="eyebrow">Private by design</div><h2 id="welcome-title" tabindex="-1">Connecting securely</h2><p id="welcome-detail">Your launch link is exchanged for a private session. Credentials are never stored in this page.</p></section>
+<div id="workspace" hidden>
+<section id="runner-panel" class="panel" aria-labelledby="specs-title"><div class="panel-heading"><div><h2 id="specs-title">Runner overview</h2><p class="hint">Live environment · ephemeral by design</p></div><button id="refresh-specs" class="quiet">Refresh</button></div><dl id="specs" class="specs"></dl><p id="specs-status" class="status" role="status"></p></section>
+<section id="terminal-panel" class="panel" aria-labelledby="terminal-title" hidden>
+<div class="panel-heading"><div><div class="eyebrow">01 / Console</div><h2 id="terminal-title">Runner terminal</h2><p class="hint">Each command runs in a fresh bash process. Change the persistent directory below.</p></div></div>
+<fieldset id="terminal-controls" disabled><legend class="hint">Command controls</legend>
+<form id="cwd-form"><div class="row"><div class="grow"><label for="cwd">Working directory</label><input id="cwd" autocomplete="off" spellcheck="false" placeholder="/path/to/directory" required></div><button type="submit">Change directory</button></div></form>
+<p class="cwd-display subtle space">Current: <span id="current-cwd" class="mono">—</span></p>
+<form id="command-form"><label for="command">Bash command · multiline supported</label><textarea id="command" spellcheck="false" autocapitalize="off" autocomplete="off" placeholder="pwd&#10;ls -lah" aria-describedby="command-help"></textarea><p id="command-help" class="hint">Ctrl / ⌘ + Enter to run. Shell variables and “cd” inside a command do not carry over to the next request.</p><div class="wrap"><button class="primary" id="run-command" type="submit">Run command</button><button id="history-prev" type="button" class="quiet">Previous command</button><button id="history-next" type="button" class="quiet">Next command</button></div></form>
+<div class="quick wrap space" aria-label="Insert a read-only command"><button type="button" data-command="pwd">pwd</button><button type="button" data-command="ls -lah">ls -lah</button><button type="button" data-command="df -h">Disk usage</button><button type="button" data-command="free -h">Memory</button><button type="button" data-command="uname -a">System</button></div>
+<div class="terminal-bar"><span id="output-label">Command output</span><button id="clear-output" type="button" class="quiet">Clear output</button></div>
+</fieldset><pre id="output" tabindex="0" aria-labelledby="output-label"></pre><p id="terminal-status" class="status" role="status" aria-live="polite">Ready for a command.</p>
+</section>
+<section id="studio-panel" class="panel" aria-labelledby="studio-title" hidden>
+<div class="panel-heading"><div><div class="eyebrow">02 / Studio</div><h2 id="studio-title">Make the cut.</h2><p class="hint">Select up to 8 segments. They are joined in the order shown.</p></div></div>
+<div class="studio-grid"><div class="media-side"><h3 id="media-title" class="media-title">Loading media…</h3><p id="media-meta" class="hint"></p><video id="video" controls controlslist="nodownload" playsinline preload="metadata" aria-label="Source video preview"></video><div class="playback"><span class="mono hint">Playhead <span id="playhead">00:00:00</span></span><button id="stop-preview" class="quiet" type="button">Stop preview</button></div><details><summary>How preview &amp; cropping work</summary><p>“From playhead” copies the current video time. Preview plays one segment and stops at its end; native controls can play the full source. Spatial crop is applied during rendering, not to this source preview. Only edited output is available for download.</p></details></div>
+<div><form id="edit-form" novalidate><fieldset id="edit-controls" disabled><legend>Your edit</legend><div id="segments"></div><div class="wrap"><button id="add-segment" type="button" class="quiet">+ Add segment</button><span id="segment-count" class="count">0 / 8 segments</span></div><p class="hint space">Enter seconds (12.5) or hh:mm:ss (00:01:12.500). Start must precede end.</p><div class="divider"><label class="check-label" for="crop-enabled"><input id="crop-enabled" type="checkbox">Apply spatial crop</label><div id="crop-fields" hidden><p class="hint">Origin is the top-left corner. Width and height must be even pixels and fit within the source.</p><div class="crop-grid"><div><label for="crop-x">X position · px</label><input id="crop-x" type="number" min="0" step="1" value="0" inputmode="numeric"></div><div><label for="crop-y">Y position · px</label><input id="crop-y" type="number" min="0" step="1" value="0" inputmode="numeric"></div><div><label for="crop-width">Width · px</label><input id="crop-width" type="number" min="2" step="2" inputmode="numeric"></div><div><label for="crop-height">Height · px</label><input id="crop-height" type="number" min="2" step="2" inputmode="numeric"></div></div></div></div><p id="estimate">Estimated output · —</p><div class="render-row"><button id="render" class="primary" type="submit">Render edited video</button></div></fieldset></form></div></div>
+<p id="studio-status" class="status" role="status" aria-live="polite"></p><div class="wrap space"><button id="retry-media" type="button" class="quiet" hidden>Retry media information</button><button id="retry-poll" type="button" class="quiet" hidden>Check job again</button><a id="download" class="button" download hidden>Download edited video</a></div>
+</section>
+</div>
+</main>
+<footer><span>RECLIP / Private, temporary, yours.</span><span>No credentials saved in browser storage.</span></footer>
+<template id="segment-template"><div class="segment"><div class="segment-top"><span class="segment-name"></span><button type="button" data-remove class="quiet" aria-label="Remove this segment">Remove</button></div><div class="time-grid"><div><label data-label="start">Start time</label><input data-time="start" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="00:00:00"><button type="button" data-set="start" class="quiet" aria-label="Set segment start from playhead">Start from playhead</button></div><div><label data-label="end">End time</label><input data-time="end" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="00:00:10"><button type="button" data-set="end" class="quiet" aria-label="Set segment end from playhead">End from playhead</button></div></div><div class="segment-actions"><button type="button" data-preview class="quiet">Preview segment</button></div></div></template>
+</body>
+</html>

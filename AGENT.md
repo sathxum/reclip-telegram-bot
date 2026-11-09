@@ -45,7 +45,10 @@ Expected scopes include `repo` and `workflow`.
 ```
 .
 ├── bot.py                      # the whole bot (WARP + quick tunnel + UI + engine + admin)
-├── requirements.txt            # requests, yt-dlp
+├── admin_server.py             # separate authenticated terminal/studio listener + tunnel
+├── admin_ui.html               # self-contained mobile admin UI, no external assets
+├── tests/test_admin.py         # local HTTP/security/ffmpeg/bot regression tests
+├── requirements.txt            # requests, yt-dlp, PySocks
 ├── README.md                   # human setup guide
 ├── AGENT.md                    # this file
 └── .github/workflows/bot.yml   # GitHub Actions runner
@@ -165,7 +168,8 @@ Success = run `in_progress` with step **"Run bot"** running, and `getMe` returns
 | `TUNNEL_ENABLE` | `1` | bring up the Cloudflare quick tunnel for big files |
 | `TUNNEL_TTL_MIN` | `10` | how long a full-quality link lives before auto-wipe |
 | `TUNNEL_PORT` | `8791` | local port the private share server binds (127.0.0.1) |
-| `ADMIN_ID` | — | fixed admin Telegram user id (optional; else auto-detected) |
+| `ADMIN_ID` | — | positive fixed Telegram user id; required for terminal/studio (workflow reads repository variable `ADMIN_ID`); legacy stats admin may still auto-detect |
+| `ADMIN_PORT` | `8792` | separate loopback authenticated admin HTTP listener; never use `TUNNEL_PORT` |
 
 ---
 
@@ -220,3 +224,84 @@ Success = run `in_progress` with step **"Run bot"** running, and `getMe` returns
 | Change big-file page look | `_share_html()` |
 | Change admin panel text | `handle_admin()` |
 | Add a new command | `handle_update()` message branch + a `handle_*` function |
+
+
+---
+
+## 11. Authenticated admin terminal and Video Studio (local implementation)
+
+### Privilege and routing — do not weaken these boundaries
+
+- Configure a **positive, explicit numeric `ADMIN_ID`** repository **variable** (not a
+  changed secret). The Ubuntu workflow passes `${{ vars.ADMIN_ID }}`. Local operators
+  can use the environment variable. Missing/invalid/non-positive IDs disable these tools;
+  first-user auto-admin remains only for the legacy stats panel, **never shell/studio**.
+- `/cmd` and video-delivery choice require both Telegram `from.id == ADMIN_ID` and
+  `chat.id == ADMIN_ID` (private admin chat). Do not send shell capabilities into groups.
+- General users retain small-file Telegram delivery, large-file anonymous unlisted
+  sharing and existing fallback compression. Fixed admin video selection adds **Telegram
+  video** versus **URL · Video Studio**, including small videos. Admin Telegram selection
+  uses compression/splitting for large videos instead of silently switching to a URL.
+  MP3 behavior remains unchanged.
+- **Do not add execution/authenticated APIs to `_ShareHandler`.** It still exposes only
+  the public single-file share page/media. `admin_server.py` starts a separate
+  `127.0.0.1:8792` listener and separate HTTPS Cloudflare quick tunnel on demand.
+  `ADMIN_PORT` must differ from `TUNNEL_PORT`; tunnel failure produces a retry message,
+  not an anonymous shell or studio fallback. Public share/server code is unchanged.
+- Launch links contain a 256-bit random token in the **URL fragment**, removed immediately
+  by the self-contained page before exchange. Single-use, 90-second launch; scoped
+  sessions last at most 10 minutes or the runner deadline. Capabilities remain memory-only.
+  Never log launch/session/CSRF tokens or load third-party fonts/scripts/analytics.
+- Each tab uses its own `__Host-reclip_admin_<sid>` Secure/HttpOnly/SameSite=Strict cookie.
+  `sid` is only a **non-secret selector**, retained in same-origin URLs for media/reload;
+  it cannot authenticate without its matching cookie. Every API/media/edit-download
+  checks session, fixed admin, expiry and scope. All POSTs check exact Origin/Host;
+  authenticated POSTs additionally require in-memory CSRF. CSP hashes the bundled
+  script/style; no external assets, cross-origin calls, framing, indexing or caching.
+
+### Console and media behavior
+
+- Runner specs are read from actual `/etc/os-release`, `/proc` and filesystem data:
+  never label a machine Ubuntu merely because the workflow requests `ubuntu-latest`.
+- Real non-interactive `/bin/bash --noprofile --norc -c` as the **bot OS user**; multiline
+  input, Ctrl/Cmd+Enter, history, stderr and exit status. Commands do not keep shell
+  variables or interactive PTYs; use explicit directory controls for persistent cwd.
+- Console is **trusted-admin full remote execution, not a sandbox**. It does not inherit
+  BOT_TOKEN/GH_PAT/etc into subprocess environment, but a trusted admin can still read
+  runner files/processes, use sudo where allowed, and deliberately escape process groups.
+  Do not run untrusted commands or print credentials. Process-group kills handle normal
+  background children, not deliberate `setsid` escapes; the fresh runner teardown is the
+  final lifetime boundary. Hard SIGKILL cannot trigger Python cleanup.
+- Limits: one command/render globally; 30-second commands, 64 KiB captured raw output,
+  4096-character commands, 16 HTTP connection slots, 10-second absolute header/body reads,
+  8 active launch/session entries, 3 renders per studio. Responses close connections.
+  These are local bounds, **not DDoS protection** for a publicly discoverable tunnel.
+- Studio previews the source, accepts 1–8 ordered/non-overlapping segments in seconds or
+  hh:mm:ss, and optionally an even-pixel x/y/width/height crop. Max edited length 600s;
+  ffmpeg transcodes accurate trim/concat/crop to H.264/AAC MP4 (lossy, not stream-copy),
+  max 180 seconds render time, 256 MiB output, 2 encoding/filter threads.
+- Browser-native playback depends on original source codec; an unsupported preview does
+  not prevent editing. Crop is disabled for rotated/non-square-pixel sources to avoid
+  misleading coordinates; trimming normalizes rotation/aspect. No visual drag-crop UI.
+- Only edited clips have a download control/attachment endpoint. **Preview bytes cannot
+  be made unsaveable** to the authenticated admin; native download controls are suppressed,
+  not DRM. Each delivery uses a unique source filename. Sources/edited clips are deleted
+  on launch expiry, session expiry/logout, tunnel replacement or shutdown; no persistence.
+  Deletion is filesystem unlinking, not a forensic secure-erase guarantee.
+- Admin server has a deadline reaper, atexit cleanup and graceful SIGTERM handling.
+  Shell/session/cwd state never survives a worker restart. Cloudflare URL changes require
+  fresh launch links. The workflow still runs `ubuntu-latest`, Python 3.11 with ffmpeg.
+
+### Local verification (no bot, Telegram, GitHub APIs or tunnel needed)
+
+```bash
+python -m unittest discover -s tests -v
+python -m py_compile bot.py admin_server.py tests/test_admin.py
+```
+
+Tests use stdlib unittest/HTTP, installed requests and local ffmpeg/ffprobe synthetic
+fixtures; the dummy import token is never used for Telegram. Cover anonymous denial,
+fixed admin/sender/job ownership, launch replay/expiry, cookie tab isolation, origin/CSRF,
+scoped media routes, bounded real shell, cleanup, edit validation and real trim/concat/crop
+output. Tests do **not** dispatch workflows, mutate secrets or deploy changes. Live
+Cloudflare/Telegram and Ubuntu-runner smoke checks must be done separately by an operator.

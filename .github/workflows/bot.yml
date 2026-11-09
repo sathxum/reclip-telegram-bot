@@ -57,6 +57,8 @@ jobs:
           TUNNEL_ENABLE: '1'
           TUNNEL_TTL_MIN: '10'
           WGCF_PROFILE: ${{ secrets.WGCF_PROFILE }}
+          # Explicit numeric repository variable; unset disables terminal/studio.
+          ADMIN_ID: ${{ vars.ADMIN_ID }}
         run: |
           python bot.py
 

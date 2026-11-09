@@ -77,7 +77,7 @@ Actions tab → allow workflows → **Run workflow** (or wait for the cron).
 | `WARP_PROXY_PORT` | `25344` | local SOCKS5 port for the relay |
 | `TUNNEL_ENABLE` | `1` | enable the quick tunnel for big files |
 | `TUNNEL_TTL_MIN` | `10` | how long a full-quality link lives before auto-wipe |
-| `ADMIN_ID` | — | fixed admin user id (optional; else auto-detected) |
+| `ADMIN_ID` | — | fixed positive user id; required for terminal/studio; workflow reads repository variable `ADMIN_ID` (legacy stats auto-detection stays separate) |
 | `WGCF_PROFILE` | — | optional pre-made WARP WireGuard profile |
 
 Agent handoff instructions live in **[AGENT.md](AGENT.md)**.
@@ -93,3 +93,23 @@ python bot.py
 ## License
 
 MIT — based on [ReClip](https://github.com/averygan/reclip).
+
+
+## Fixed-admin workspace
+
+Set the repository **variable** `ADMIN_ID` to your numeric Telegram user ID (or set
+that environment variable locally). No secret changes are needed. In your private
+bot chat, `/cmd` opens a short-lived Cloudflare HTTPS **Runner Terminal** with actual
+OS/CPU/RAM/disk specs, multiline commands and mobile-friendly controls. Video quality
+selection also offers **Telegram video** or **URL · Video Studio** for this fixed admin
+only. Studio previews the video, trims up to eight ordered segments, optionally crops
+in even pixels, and exports only the edited H.264/AAC MP4 via its download control.
+
+The separate authenticated admin listener never adds shell access to anonymous share
+routes. Launch links are single-use (90s); sessions expire after 10 minutes or runner
+exit. Terminal is trusted-admin remote execution, **not a sandbox/interactive PTY**:
+30s command limit, 64 KiB captured output, one command/render at a time. Studio limits:
+10-minute edited length, 180s render time, 256 MiB output; rotated/anamorphic media does
+not offer pixel cropping. Preview saving cannot technically be prevented. Files and
+sessions are ephemeral. See [AGENT.md §11](AGENT.md#11-authenticated-admin-terminal-and-video-studio-local-implementation)
+for security, configuration, cleanup and testing details.
